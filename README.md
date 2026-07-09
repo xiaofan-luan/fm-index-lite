@@ -168,7 +168,7 @@ the default build has no OpenMP dependency and is single-threaded.
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
-./build/test_fmindex     # 48 tests / 391k checks (concurrency, Extract, 32/64-bit)
+./build/test_fmindex     # unit tests: fuzz vs brute force, concurrency, Extract, 32/64-bit, corrupt-blob
 ./build/demo             # tiny walkthrough of the anchored + case-insensitive API
 ./build/bench_fmindex    # build / count / batch / locate / size
 ./build/bench_mmap       # in-RAM vs mmap query throughput

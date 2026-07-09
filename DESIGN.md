@@ -175,7 +175,7 @@ level buys ~1% — deliberately not done. The two real levers:
 - Verified continuously: every `Count` is checked byte-identical against sdsl-lite
   on 120k queries, plus 200-trial randomized fuzz vs a brute-force oracle, plus
   `CountBatch == Count`, across sample rates and alphabets (empty, single,
-  all-same, full 256-byte, binary). See `test/test_fmindex.cpp` (25 tests).
+  all-same, full 256-byte, binary). See `test/test_fmindex.cpp`.
 
 ## 7. Serialization format
 

@@ -109,8 +109,8 @@ are **3–6× faster than the reference at equal size**.
 | +CountBatch (MLP) | lock-step batched backward search + prefetch, tile 32 | **batch count 2× single** |
 | +4-ary QWT | quad wavelet matrix, half the levels, SWAR quad-rank | text single 1.0→1.5 M, batch → 5.1 M |
 
-All 35 unit tests / 381,829 checks pass; counts byte-identical to sdsl on 120k
-queries throughout.
+The full unit-test suite passes; counts were byte-identical to sdsl across 120k
+queries throughout development.
 
 ## Reproduce
 
