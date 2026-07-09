@@ -123,6 +123,8 @@ calling `Count` in a loop. It is the right primitive for decontamination
 | `CountBatch(patterns)` | counts for many patterns, high throughput |
 | `Locate(pat, len)` | sorted text positions of every occurrence |
 | `LocateDocs(pat, len)` | sorted `(doc_id, offset)` of every occurrence |
+| `MatchingDocs(pat, len)` | sorted, unique **doc ids** containing `pat` (exact `LIKE '%pat%'`) |
+| `FuzzyMatchingDocs(pat, len, k)` | sorted, unique **doc ids** containing a substring within **edit distance ≤ k** of `pat` |
 | `LocatePrefixDocs(pat, len)` / `CountPrefixDocs` | documents that **begin** with `pat` |
 | `LocateSuffixDocs(pat, len)` / `CountSuffixDocs` | documents that **end** with `pat` |
 | `Extract(pos, len)` | recover the original bytes `T[pos, pos+len)` (match context) |
@@ -140,6 +142,17 @@ document ids. Both need `SetDocStarts` to be meaningful.
 to `a-z` at build time, so every query matches case-insensitively at **zero query-time
 cost** (`Locate` offsets still point into the original text). Only ASCII case is
 folded — non-ASCII / UTF-8 bytes stay exact.
+
+**Document-granularity filtering (for a scalar index).** A columnar filter wants a
+per-row boolean — *which rows contain this pattern* — not positions. `MatchingDocs(pat)`
+returns the sorted, unique doc ids that contain `pat` exactly (`col LIKE '%pat%'`), and
+`FuzzyMatchingDocs(pat, k)` returns the doc ids that contain a substring within **edit
+distance ≤ k** of `pat` (typo / variant tolerant — names, domains, codes). Both are
+document-scoped: a match is only counted if it lies *inside* one document, so a span that
+straddles the seam between two concatenated docs is never reported. `FuzzyMatchingDocs` is
+a backtracking backward search (substitution / insertion / deletion against an error
+budget), so its cost grows fast with `k` and the alphabet — `k` is meant to be small (1–2)
+over short patterns; `k == 0` is exactly `MatchingDocs`.
 
 **Token-level index (`TokenFMIndex`).** The byte `FMIndex` matches byte substrings.
 For LLM decontamination the unit is *N consecutive tokens* (e.g. a 13-token overlap,

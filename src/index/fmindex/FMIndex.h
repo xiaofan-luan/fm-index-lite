@@ -137,6 +137,22 @@ class FMIndex {
     std::vector<std::pair<uint8_t, size_t>>
     NextTokenCounts(const uint8_t* pattern, size_t plen) const;
 
+    // Sorted, unique document ids that contain `pat` (exact substring) — the
+    // doc-granularity result a scalar filter needs (LIKE '%pat%'). Equivalent to
+    // the distinct doc ids of LocateDocs, i.e. cross-document seam matches are
+    // excluded.
+    std::vector<uint64_t>
+    MatchingDocs(const uint8_t* pat, size_t plen) const;
+
+    // Sorted, unique document ids containing a substring within edit distance
+    // <= k of `pat` (typo / variant tolerant: names, domains, codes). Also
+    // doc-granularity. Implemented by backtracking backward search, so cost
+    // grows fast with k and the alphabet — k is meant to be small (1-2) over
+    // short patterns. k == 0 is exactly MatchingDocs. Attribution is by the
+    // match's start position (a fuzzy match's length varies by +/-k).
+    std::vector<uint64_t>
+    FuzzyMatchingDocs(const uint8_t* pat, size_t plen, uint32_t k) const;
+
     // --- accessors used by tests ---
     size_t
     bwt_size() const {

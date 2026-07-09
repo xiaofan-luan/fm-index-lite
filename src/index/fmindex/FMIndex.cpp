@@ -4,7 +4,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <map>
+#include <set>
 #include <stdexcept>
+#include <tuple>
 #include "index/fmindex/SuffixArray.h"
 
 #ifdef FMIX_BUILD_MEM_PROFILE
@@ -278,6 +282,116 @@ FMIndex::NextTokenCounts(const uint8_t* pattern, size_t plen) const {
         }
     }
     return out;
+}
+
+std::vector<uint64_t>
+FMIndex::MatchingDocs(const uint8_t* pat, size_t plen) const {
+    auto hits = LocateDocs(pat, plen);  // (doc, offset), cross-doc seam filtered
+    std::vector<uint64_t> docs;
+    docs.reserve(hits.size());
+    for (auto& h : hits) {
+        docs.push_back(h.first);
+    }
+    docs.erase(std::unique(docs.begin(), docs.end()), docs.end());  // sorted
+    return docs;
+}
+
+std::vector<uint64_t>
+FMIndex::FuzzyMatchingDocs(const uint8_t* pat, size_t plen, uint32_t k) const {
+    if (c_.empty() || plen == 0) {
+        return {};
+    }
+    const size_t m = text_len_ + 1;
+    // Backtracking backward search: DFS over SA intervals, spending an error
+    // budget on substitution / insertion (extra text char) / deletion (skipped
+    // pattern char). At i==0 the prepended string T' has edit distance e<=k to
+    // `pat`; record its interval and length (mlen = matched text chars). memoize
+    // (lo,hi,i)->min errors to prune redundant edit paths.
+    struct Hit {
+        size_t lo, hi, mlen;
+    };
+    std::vector<Hit> hits;
+    std::map<std::tuple<size_t, size_t, size_t>, uint32_t> visited;
+    std::function<void(size_t, size_t, size_t, uint32_t, size_t)> dfs =
+        [&](size_t lo, size_t hi, size_t i, uint32_t e, size_t mlen) {
+            if (i == 0) {
+                hits.push_back({lo, hi, mlen});
+                return;
+            }
+            auto key = std::make_tuple(lo, hi, i);
+            auto v = visited.find(key);
+            if (v != visited.end() && v->second <= e) {
+                return;
+            }
+            visited[key] = e;
+            int32_t tid = byte_to_id_[pat[i - 1]];
+            auto step = [&](uint32_t d, size_t& nlo, size_t& nhi) {
+                auto pp = wm_.map2(d, lo, hi);
+                size_t base = c_[d] - first_[d];
+                nlo = base + pp.first;
+                nhi = base + pp.second;
+            };
+            if (e == k) {  // budget spent: only exact matches from here on
+                if (tid >= 0) {
+                    size_t nlo, nhi;
+                    step(static_cast<uint32_t>(tid), nlo, nhi);
+                    if (nlo < nhi) {
+                        dfs(nlo, nhi, i - 1, e, mlen + 1);
+                    }
+                }
+                return;
+            }
+            dfs(lo, hi, i - 1, e + 1, mlen);  // deletion: skip pat[i-1], no text
+            for (uint32_t d = 1; d < sigma_; ++d) {
+                size_t nlo, nhi;
+                step(d, nlo, nhi);
+                if (nlo >= nhi) {
+                    continue;
+                }
+                if (tid >= 0 && static_cast<uint32_t>(tid) == d) {
+                    dfs(nlo, nhi, i - 1, e, mlen + 1);  // match, no cost
+                } else {
+                    dfs(nlo, nhi, i - 1, e + 1, mlen + 1);  // substitution
+                }
+                dfs(nlo, nhi, i, e + 1, mlen + 1);  // insertion: extra text char
+            }
+        };
+    dfs(0, m, plen, 0, 0);
+
+    // A doc matches iff some matched T' lies fully inside it; attribute by T''s
+    // start position and require start+mlen <= that document's end boundary.
+    std::set<uint64_t> docset;
+    std::map<size_t, uint64_t> row_pos;  // cache row -> text position
+    for (auto& h : hits) {
+        for (size_t r = h.lo; r < h.hi; ++r) {
+            uint64_t pos;
+            auto c = row_pos.find(r);
+            if (c != row_pos.end()) {
+                pos = c->second;
+            } else {
+                size_t row = r;
+                uint64_t steps = 0;
+                while (!sampled_bv_.get(row)) {
+                    row = LF(row);
+                    ++steps;
+                }
+                pos = sa_sample_vals_[sampled_bv_.rank1(row)] + steps;
+                row_pos[r] = pos;
+            }
+            if (pos >= text_len_) {
+                continue;
+            }
+            auto it = std::upper_bound(doc_start_.begin(), doc_start_.end(), pos);
+            uint64_t doc = static_cast<uint64_t>(it - doc_start_.begin()) - 1;
+            uint64_t doc_end = (doc + 1 < doc_start_.size())
+                                   ? doc_start_[doc + 1]
+                                   : text_len_;
+            if (pos + h.mlen <= doc_end) {  // T' fits inside the document
+                docset.insert(doc);
+            }
+        }
+    }
+    return {docset.begin(), docset.end()};
 }
 
 size_t

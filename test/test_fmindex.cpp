@@ -3,6 +3,7 @@
 #include <atomic>
 #include <map>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1312,6 +1313,87 @@ TEST(TokenFMIndex, VsNaiveOracle) {
         size_t wl = std::min<size_t>(len, corpus.size() - pos);
         std::vector<uint32_t> want(corpus.begin() + pos, corpus.begin() + pos + wl);
         CHECK_EQ(fm.Extract(pos, len), want);
+    }
+}
+
+TEST(FMIndex, MatchingDocsAndFuzzyVsOracle) {
+    std::vector<std::string> docs = {"paypal login here", "paypa1 secure page",
+                                     "visit the paypall site", "unrelated content",
+                                     "pay pal support",       "totally different"};
+    std::string concat;
+    std::vector<uint64_t> starts;
+    for (auto& d : docs) { starts.push_back(concat.size()); concat += d; }
+    FMIndex fm;
+    fm.Build(bytes(concat), concat.size(), 4);
+    fm.SetDocStarts(starts);
+
+    // exact: MatchingDocs == docs whose text contains P as a substring
+    auto exact_oracle = [&](const std::string& p) {
+        std::vector<uint64_t> v;
+        for (size_t d = 0; d < docs.size(); ++d)
+            if (docs[d].find(p) != std::string::npos) v.push_back(d);
+        return v;
+    };
+    // fuzzy: a doc matches iff its OWN text contains a substring within edit
+    // distance k of P (Sellers approximate substring matching, run per doc, so a
+    // match never spans a document boundary). D[0][j] = 0 (empty pattern matches
+    // ending anywhere at 0 cost); doc hit iff min_j D[pl][j] <= k.
+    auto approx_in = [](const std::string& p, const std::string& w, uint32_t k) {
+        const size_t pl = p.size(), nd = w.size();
+        std::vector<int> prev(nd + 1, 0), cur(nd + 1, 0);
+        for (size_t i = 1; i <= pl; ++i) {
+            cur[0] = static_cast<int>(i);
+            for (size_t j = 1; j <= nd; ++j) {
+                int sub = prev[j - 1] + (p[i - 1] == w[j - 1] ? 0 : 1);
+                cur[j] = std::min({sub, prev[j] + 1, cur[j - 1] + 1});
+            }
+            std::swap(prev, cur);
+        }
+        return *std::min_element(prev.begin(), prev.end()) <= static_cast<int>(k);
+    };
+    auto fuzzy_oracle = [&](const std::string& p, uint32_t k) {
+        std::vector<uint64_t> ds;
+        for (size_t d = 0; d < docs.size(); ++d)
+            if (approx_in(p, docs[d], k)) ds.push_back(d);
+        return ds;
+    };
+
+    for (std::string p : {"paypal", "secure", "pal", "xyz", "different"}) {
+        CHECK_EQ(fm.MatchingDocs(bytes(p), p.size()), exact_oracle(p));
+        // k == 0 fuzzy equals the by-start exact oracle
+        CHECK_EQ(fm.FuzzyMatchingDocs(bytes(p), p.size(), 0), fuzzy_oracle(p, 0));
+        for (uint32_t k = 1; k <= 2; ++k)
+            CHECK_EQ(fm.FuzzyMatchingDocs(bytes(p), p.size(), k),
+                     fuzzy_oracle(p, k));
+    }
+
+    // randomized: small alphabet so edits actually land on real substrings
+    std::mt19937 rng(909);
+    std::string text;
+    std::vector<uint64_t> rstarts;
+    for (int d = 0; d < 30; ++d) {
+        rstarts.push_back(text.size());
+        size_t dl = 5 + rng() % 15;
+        for (size_t i = 0; i < dl; ++i) text += char('a' + rng() % 4);
+    }
+    FMIndex rfm;
+    rfm.Build(bytes(text), text.size(), 4);
+    rfm.SetDocStarts(rstarts);
+    auto rfuzzy = [&](const std::string& p, uint32_t k) {
+        std::vector<uint64_t> ds;
+        for (size_t d = 0; d < rstarts.size(); ++d) {
+            size_t s = rstarts[d];
+            size_t e = (d + 1 < rstarts.size()) ? rstarts[d + 1] : text.size();
+            if (approx_in(p, text.substr(s, e - s), k)) ds.push_back(d);
+        }
+        return ds;
+    };
+    for (int q = 0; q < 60; ++q) {
+        size_t pl = 2 + rng() % 4;
+        std::string p;
+        for (size_t j = 0; j < pl; ++j) p += char('a' + rng() % 4);
+        for (uint32_t k = 0; k <= 2; ++k)
+            CHECK_EQ(rfm.FuzzyMatchingDocs(bytes(p), p.size(), k), rfuzzy(p, k));
     }
 }
 
