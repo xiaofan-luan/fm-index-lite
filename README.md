@@ -59,9 +59,15 @@ std::string concat;
 std::vector<uint64_t> doc_start;
 for (const std::string& d : docs) { doc_start.push_back(concat.size()); concat += d; }
 
-// 2. build (sa_sample_rate 32 = smaller index; 4 = faster locate)
+// 2. build
+//    Build(data, len, sa_sample_rate = 32)
+//      data           first byte of the concatenated buffer
+//      len            its length in BYTES (< 2^31; shard larger corpora)
+//      sa_sample_rate SA sampling rate: space/locate trade-off, no effect on
+//                     Count — default 32 is balanced; 4-8 = faster Locate,
+//                     bigger index; 64+ = smaller index if you only Count
 FMIndex fm;
-fm.Build(reinterpret_cast<const uint8_t*>(concat.data()), concat.size(), 32);
+fm.Build(reinterpret_cast<const uint8_t*>(concat.data()), concat.size());  // sa_sample_rate defaults to 32
 fm.SetDocStarts(doc_start);
 
 // 3. query
@@ -99,22 +105,34 @@ calling `Count` in a loop. It is the right primitive for decontamination
 
 | Call | Returns |
 |---|---|
-| `Build(data, len, sa_sample_rate)` | build the index over a byte buffer |
+| `Build(data, len, sa_sample_rate=32, case_insensitive=false)` | build the index over a byte buffer |
 | `SetDocStarts(offsets)` | document boundaries (optional; default = one doc) |
 | `Count(pat, len)` | exact occurrence count |
 | `CountBatch(patterns)` | counts for many patterns, high throughput |
 | `Locate(pat, len)` | sorted text positions of every occurrence |
 | `LocateDocs(pat, len)` | sorted `(doc_id, offset)` of every occurrence |
+| `LocatePrefixDocs(pat, len)` / `CountPrefixDocs` | documents that **begin** with `pat` |
+| `LocateSuffixDocs(pat, len)` / `CountSuffixDocs` | documents that **end** with `pat` |
 | `Serialize()` / `SerializeToFile(path)` | persist the index |
 | `Deserialize(blob)` / `LoadView(base, size)` | load (copy / zero-copy mmap) |
+
+**Anchored matching.** `Count`/`Locate` find `pat` *anywhere* (substring). To match
+only at document boundaries — "log lines starting with `ERROR`", "files ending in
+`.log`" — use `LocatePrefixDocs` / `LocateSuffixDocs`; they return the sorted, unique
+document ids. Both need `SetDocStarts` to be meaningful.
+
+**Case-insensitive.** Pass `case_insensitive=true` to `Build`: ASCII `A-Z` are folded
+to `a-z` at build time, so every query matches case-insensitively at **zero query-time
+cost** (`Locate` offsets still point into the original text). Only ASCII case is
+folded — non-ASCII / UTF-8 bytes stay exact.
 
 **Concurrency:** all queries are `const` and lock-free — many threads may query one
 index at once. **Immutable:** build-once; to update, rebuild (or, at scale, add a
 new shard and mask deletes at query time). **Serving:** `LoadView` maps the index
 zero-copy from an mmap'd file — warm query throughput equals in-RAM.
 
-Not supported (by design): regex, prefix/range, incremental update, case-insensitive
-match.
+Not supported (by design): regex, arbitrary lexicographic range between two different
+strings (needs forward navigation), incremental update, Unicode-aware case folding.
 
 ## Build & test
 

@@ -20,10 +20,30 @@ class FMIndex {
  public:
     FMIndex() = default;
 
-    // sa_sample_rate>=1: store SA every Nth text position (1 = all; larger =
-    // smaller index, slower locate).
+    // Build the index over one contiguous byte buffer (the concatenation of all
+    // your documents).
+    //
+    //   data            pointer to the first byte of the buffer.
+    //   len             its length in BYTES (not documents, not characters;
+    //                   a UTF-8 CJK char counts as its 3 bytes). Must be
+    //                   < 2^31; for larger corpora, shard and build one index
+    //                   per shard. Count/Locate are exact over [data, data+len).
+    //   sa_sample_rate  suffix-array sampling rate R (>= 1): store one SA value
+    //                   every R text positions, recovering the rest via LF-
+    //                   mapping. Pure space/locate trade-off, zero effect on
+    //                   Count or correctness: larger R = smaller index but
+    //                   slower Locate/LocateDocs (up to R-1 extra LF steps per
+    //                   hit); smaller R = faster Locate, larger sample array
+    //                   (~len/R * 4 bytes). Default 32 is balanced; use 4-8 if
+    //                   you Locate often, 64+ if you only ever Count.
+    //   case_insensitive  when true, ASCII letters A-Z are folded to a-z at
+    //                   build time (both cases share one symbol), so all queries
+    //                   match case-insensitively with zero query-time cost. Only
+    //                   ASCII case is folded; non-ASCII / UTF-8 bytes are left
+    //                   exact. Locate offsets still refer to the original text.
     void
-    Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate);
+    Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate = 32,
+          bool case_insensitive = false);
 
     // Half-open SA interval [lo, hi) for pattern; lo==hi means no match.
     std::pair<size_t, size_t>
@@ -59,6 +79,29 @@ class FMIndex {
     std::vector<std::pair<uint64_t, uint64_t>>
     LocateDocs(const uint8_t* pattern, size_t plen) const;
 
+    // Documents that BEGIN with the pattern (anchored prefix match), as sorted,
+    // unique document ids. A hit is an occurrence whose text position is exactly
+    // a document boundary. Requires SetDocStarts to be meaningful; with the
+    // default single document it reports {0} iff the whole corpus starts with P.
+    std::vector<uint64_t>
+    LocatePrefixDocs(const uint8_t* pattern, size_t plen) const;
+    // Number of documents that begin with the pattern.
+    size_t
+    CountPrefixDocs(const uint8_t* pattern, size_t plen) const {
+        return LocatePrefixDocs(pattern, plen).size();
+    }
+
+    // Documents that END with the pattern (anchored suffix match), as sorted,
+    // unique document ids. A hit is an occurrence whose end (pos + plen) lands
+    // exactly on the document's end boundary.
+    std::vector<uint64_t>
+    LocateSuffixDocs(const uint8_t* pattern, size_t plen) const;
+    // Number of documents that end with the pattern.
+    size_t
+    CountSuffixDocs(const uint8_t* pattern, size_t plen) const {
+        return LocateSuffixDocs(pattern, plen).size();
+    }
+
     // --- accessors used by tests ---
     size_t
     bwt_size() const {
@@ -75,6 +118,10 @@ class FMIndex {
     uint32_t
     c_at(uint32_t c) const {
         return c_[c];
+    }
+    bool
+    case_insensitive() const {
+        return case_fold_;
     }
 
     // --- serialization ---
@@ -110,6 +157,7 @@ class FMIndex {
     writeHeader(std::string& s) const;
 
     uint32_t sa_sample_rate_ = 1;
+    bool case_fold_ = false;             // ASCII A-Z folded to a-z at build time
     uint64_t text_len_ = 0;              // original byte count (no sentinel)
     uint32_t sigma_ = 1;                 // dense alphabet size incl sentinel
     uint32_t qlevels_ = 0;              // ceil(ceil(log2(sigma_)) / 2)

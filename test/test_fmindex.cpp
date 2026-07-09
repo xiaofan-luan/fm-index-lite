@@ -744,6 +744,108 @@ TEST(FMIndex, MmapFileRoundTrip) {
     std::remove(path.c_str());
 }
 
+TEST(FMIndex, PrefixDocsAnchored) {
+    std::vector<std::string> docs = {"error: disk full", "warning: low mem",
+                                     "error: timeout", "erratic value"};
+    std::string concat;
+    std::vector<uint64_t> starts;
+    for (auto& d : docs) {
+        starts.push_back(concat.size());
+        concat += d;
+    }
+    FMIndex fm;
+    fm.Build(bytes(concat), concat.size(), 4);
+    fm.SetDocStarts(starts);
+
+    // "error" begins docs 0 and 2 (not 3 "erratic", not 1).
+    std::string p = "error";
+    std::vector<uint64_t> expect = {0, 2};
+    CHECK_EQ(fm.LocatePrefixDocs(bytes(p), p.size()), expect);
+    CHECK_EQ(fm.CountPrefixDocs(bytes(p), p.size()), size_t(2));
+
+    // "err" begins 0, 2, 3.
+    std::string p2 = "err";
+    std::vector<uint64_t> e2 = {0, 2, 3};
+    CHECK_EQ(fm.LocatePrefixDocs(bytes(p2), p2.size()), e2);
+
+    // substring that never sits at a doc start -> no prefix docs.
+    std::string p3 = "disk";
+    CHECK_EQ(fm.CountPrefixDocs(bytes(p3), p3.size()), size_t(0));
+    CHECK(fm.Count(bytes(p3), p3.size()) == 1);  // but it does occur
+}
+
+TEST(FMIndex, SuffixDocsAnchored) {
+    std::vector<std::string> docs = {"path/to/a.log", "path/to/b.txt",
+                                     "c.log", "logistics"};
+    std::string concat;
+    std::vector<uint64_t> starts;
+    for (auto& d : docs) {
+        starts.push_back(concat.size());
+        concat += d;
+    }
+    FMIndex fm;
+    fm.Build(bytes(concat), concat.size(), 4);
+    fm.SetDocStarts(starts);
+
+    // ".log" ends docs 0 and 2 (not "logistics").
+    std::string p = ".log";
+    std::vector<uint64_t> expect = {0, 2};
+    CHECK_EQ(fm.LocateSuffixDocs(bytes(p), p.size()), expect);
+    CHECK_EQ(fm.CountSuffixDocs(bytes(p), p.size()), size_t(2));
+
+    // "log" occurs in docs 0,2,3 but ends only 0 and 2.
+    std::string p2 = "log";
+    std::vector<uint64_t> e2 = {0, 2};
+    CHECK_EQ(fm.LocateSuffixDocs(bytes(p2), p2.size()), e2);
+
+    // whole last doc as suffix.
+    std::string p3 = "logistics";
+    std::vector<uint64_t> e3 = {3};
+    CHECK_EQ(fm.LocateSuffixDocs(bytes(p3), p3.size()), e3);
+}
+
+TEST(FMIndex, CaseInsensitiveMatch) {
+    std::string text = "The Quick BROWN fox; the quick brown FOX.";
+    FMIndex fm;
+    fm.Build(bytes(text), text.size(), 4, /*case_insensitive=*/true);
+    CHECK(fm.case_insensitive());
+
+    // all case variants of "quick" find both occurrences.
+    for (std::string pat : {"quick", "QUICK", "QuIcK", "Quick"}) {
+        CHECK_EQ(fm.Count(bytes(pat), pat.size()), size_t(2));
+    }
+    // "fox" (2 occurrences: "fox" and "FOX")
+    CHECK_EQ(fm.Count(bytes("FOX"), 3), size_t(2));
+    CHECK_EQ(fm.Count(bytes("fox"), 3), size_t(2));
+
+    // Locate offsets still point into the ORIGINAL text.
+    auto pos = fm.Locate(bytes("the"), 3);
+    std::vector<uint64_t> expect = {0, 21};  // "The" at 0, "the" at 21
+    CHECK_EQ(pos, expect);
+
+    // non-letters unaffected; digits/punctuation exact.
+    CHECK_EQ(fm.Count(bytes(";"), 1), size_t(1));
+
+    // case-sensitive index does NOT fold.
+    FMIndex cs;
+    cs.Build(bytes(text), text.size(), 4);
+    CHECK(!cs.case_insensitive());
+    CHECK_EQ(cs.Count(bytes("QUICK"), 5), size_t(0));
+    CHECK_EQ(cs.Count(bytes("quick"), 5), size_t(1));
+}
+
+TEST(FMIndex, CaseInsensitiveSurvivesRoundTrip) {
+    std::string text = "Hello WORLD hello world";
+    FMIndex fm;
+    fm.Build(bytes(text), text.size(), 4, /*case_insensitive=*/true);
+    std::string blob = fm.Serialize();
+    FMIndex fm2 = FMIndex::Deserialize(blob);
+    CHECK(fm2.case_insensitive());
+    for (std::string pat : {"hello", "HELLO", "World", "WORLD"}) {
+        CHECK_EQ(fm2.Count(bytes(pat), pat.size()), size_t(2));
+    }
+}
+
 int
 main() {
     setvbuf(stdout, nullptr, _IONBF, 0);  // unbuffered: survive a crash

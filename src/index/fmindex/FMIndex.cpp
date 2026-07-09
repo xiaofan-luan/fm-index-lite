@@ -10,7 +10,8 @@
 namespace milvus::index::fmindex {
 
 void
-FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate) {
+FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate,
+               bool case_insensitive) {
     // The suffix array uses int32 indices over the length+1 buffer; reject
     // corpora that would overflow rather than silently corrupt the index.
     if (len >= static_cast<size_t>(INT32_MAX)) {
@@ -18,20 +19,33 @@ FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate) {
             "FMIndex: corpus too large (>= 2^31 bytes); use a 64-bit build");
     }
     sa_sample_rate_ = sa_sample_rate == 0 ? 1 : sa_sample_rate;
+    case_fold_ = case_insensitive;
     text_len_ = len;
     doc_start_ = {0};  // default: whole corpus is one document
 
-    // 1. dense alphabet: distinct bytes -> ids 1..sigma-1 (0 = sentinel),
-    //    order-preserving so lexicographic order of ids matches bytes.
+    // ASCII case fold: A-Z -> a-z when case_insensitive, identity otherwise.
+    auto fold = [cf = case_fold_](uint8_t b) -> uint8_t {
+        return (cf && b >= 'A' && b <= 'Z') ? static_cast<uint8_t>(b + 32) : b;
+    };
+
+    // 1. dense alphabet: distinct (folded) bytes -> ids 1..sigma-1 (0 =
+    //    sentinel), order-preserving so lexicographic order of ids matches
+    //    bytes. With case folding, both cases of a letter alias to one id, so
+    //    the query hot path stays a plain byte_to_id_ lookup (no fold branch).
     std::array<bool, 256> present{};
     for (size_t i = 0; i < len; ++i) {
-        present[data[i]] = true;
+        present[fold(data[i])] = true;
     }
     byte_to_id_.fill(-1);
     uint32_t id = 1;
     for (int b = 0; b < 256; ++b) {
         if (present[b]) {
             byte_to_id_[b] = static_cast<int32_t>(id++);
+        }
+    }
+    if (case_fold_) {
+        for (int b = 'A'; b <= 'Z'; ++b) {
+            byte_to_id_[b] = byte_to_id_[b + 32];  // uppercase aliases lowercase
         }
     }
     sigma_ = id;  // sentinel + number of distinct bytes
@@ -235,6 +249,44 @@ FMIndex::LocateDocs(const uint8_t* pattern, size_t plen) const {
     return out;
 }
 
+std::vector<uint64_t>
+FMIndex::LocatePrefixDocs(const uint8_t* pattern, size_t plen) const {
+    std::vector<uint64_t> positions = Locate(pattern, plen);
+    std::vector<uint64_t> docs;
+    for (uint64_t pos : positions) {
+        // A document begins with the pattern iff the occurrence sits exactly on
+        // that document's start boundary.
+        auto it = std::lower_bound(doc_start_.begin(), doc_start_.end(), pos);
+        if (it != doc_start_.end() && *it == pos) {
+            docs.push_back(static_cast<uint64_t>(it - doc_start_.begin()));
+        }
+    }
+    std::sort(docs.begin(), docs.end());
+    docs.erase(std::unique(docs.begin(), docs.end()), docs.end());
+    return docs;
+}
+
+std::vector<uint64_t>
+FMIndex::LocateSuffixDocs(const uint8_t* pattern, size_t plen) const {
+    std::vector<uint64_t> positions = Locate(pattern, plen);
+    std::vector<uint64_t> docs;
+    for (uint64_t pos : positions) {
+        // Find the document containing pos, then check the occurrence ends on
+        // that document's end boundary (next doc_start, or text_len for last).
+        auto it = std::upper_bound(doc_start_.begin(), doc_start_.end(), pos);
+        uint64_t doc_id = static_cast<uint64_t>(it - doc_start_.begin()) - 1;
+        uint64_t doc_end = (doc_id + 1 < doc_start_.size())
+                               ? doc_start_[doc_id + 1]
+                               : text_len_;
+        if (pos + plen == doc_end) {
+            docs.push_back(doc_id);
+        }
+    }
+    std::sort(docs.begin(), docs.end());
+    docs.erase(std::unique(docs.begin(), docs.end()), docs.end());
+    return docs;
+}
+
 // ------------------------- serialization -------------------------
 // Format v3: a header of scalars/metadata/section-sizes, then the large payload
 // arrays each padded to an 8-byte boundary so LoadView can point at them
@@ -258,7 +310,7 @@ get(const char*& p, const char* end) {
     return v;
 }
 constexpr uint32_t kMagic = 0x464D4958;  // "FMIX"
-constexpr uint32_t kFormatVersion = 3;
+constexpr uint32_t kFormatVersion = 4;
 }  // namespace
 
 void
@@ -268,7 +320,9 @@ FMIndex::writeHeader(std::string& s) const {
     put(s, sa_sample_rate_);
     put(s, sigma_);
     put(s, qlevels_);
-    put(s, static_cast<uint32_t>(0));  // pad to keep text_len 8-aligned
+    // case-fold flag lives in the former 4-byte alignment pad (keeps text_len
+    // 8-aligned); 0 = exact, 1 = ASCII case-insensitive.
+    put(s, static_cast<uint32_t>(case_fold_ ? 1 : 0));
     put(s, text_len_);
     for (int32_t v : byte_to_id_) {
         put(s, v);
@@ -365,7 +419,7 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         sa_sample_rate_ = get<uint32_t>(p, end);
         sigma_ = get<uint32_t>(p, end);
         qlevels_ = get<uint32_t>(p, end);
-        get<uint32_t>(p, end);  // pad
+        case_fold_ = get<uint32_t>(p, end) != 0;  // former pad, now case flag
         if (sigma_ == 0 || sigma_ > 257 || qlevels_ > 5) {
             return false;
         }

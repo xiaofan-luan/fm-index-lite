@@ -19,9 +19,15 @@ index answers, for any pattern `P`:
 - `LocateDocs(P)` — sorted `(doc_id, offset_within_doc)` of every occurrence.
 - `CountBatch({P_i})` — counts for many patterns at once, at much higher
   throughput (the bulk-decontamination path).
+- `LocatePrefixDocs(P)` / `LocateSuffixDocs(P)` — documents that begin / end with
+  `P` (anchored match): occurrences that land on a document boundary, obtained by
+  filtering `Locate` against `doc_start` — no extra structure.
 
-Matching is **byte-exact and case-sensitive**. Regex/prefix/range are out of
-scope (a different index serves those).
+Matching is **byte-exact** by default. Build with `case_insensitive=true` to fold
+ASCII `A-Z→a-z` at build time (both cases share one dense-alphabet symbol, so
+queries match case-insensitively at zero query-time cost). Regex and arbitrary
+lexicographic range between two different strings are out of scope — the latter
+would need forward navigation (ψ/select), which this structure does not carry.
 
 ## 2. Encoding
 
@@ -152,8 +158,9 @@ level buys ~1% — deliberately not done. The two real levers:
 
 ## 7. Serialization format
 
-A flat little-endian blob (format v3): a header — magic `"FMIX"`, version,
-`sa_sample_rate`, `σ`, `qlevels`, `text_len`, the 256-entry `byte→id` map, the
+A flat little-endian blob (format v4): a header — magic `"FMIX"`, version,
+`sa_sample_rate`, `σ`, `qlevels`, a case-fold flag (in the former alignment pad),
+`text_len`, the 256-entry `byte→id` map, the
 C-table, per-level `start[4]`, then the section sizes (per-level quad word counts,
 sampled word count, sample count, doc count) — followed by the large payload
 arrays, **each padded to an 8-byte boundary**: per quad level the 2-bit words,
@@ -189,7 +196,7 @@ cache, lazy init, or shared state, so **many threads may query concurrently
 without locks**, provided no thread is building/deserializing the same instance
 (guaranteed by the build-then-serve lifecycle).
 
-**mmap (zero-copy load).** The serialization format (v3) lays each large payload
+**mmap (zero-copy load).** The serialization format (v4) lays each large payload
 array — the quad wavelet words and the sampled-row bit words — at an 8-byte
 boundary, so they can be viewed in place from a memory mapping. `BitVector` and
 `QuadVector` store their words as a pointer + length that is either **owned**
