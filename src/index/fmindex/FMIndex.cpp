@@ -336,18 +336,15 @@ FMIndex::FuzzyMatchingDocs(const uint8_t* pat, size_t plen, uint32_t k) const {
     const size_t m = text_len_ + 1;
     // Backtracking backward search: DFS over SA intervals, spending an error
     // budget on substitution / insertion (extra text char) / deletion (skipped
-    // pattern char). At i==0 the prepended string T' has edit distance e<=k to
-    // `pat`; record its interval and length (mlen = matched text chars). memoize
-    // (lo,hi,i)->min errors to prune redundant edit paths.
-    struct Hit {
-        size_t lo, hi, mlen;
-    };
-    std::vector<Hit> hits;
+    // pattern char). The DFS never steps onto the separator id, so every matched
+    // string T' lies inside one document — no length/boundary bookkeeping needed.
+    // At i==0 record T''s SA interval; memoize (lo,hi,i)->min errors to prune.
+    std::vector<std::pair<size_t, size_t>> hits;
     std::map<std::tuple<size_t, size_t, size_t>, uint32_t> visited;
-    std::function<void(size_t, size_t, size_t, uint32_t, size_t)> dfs =
-        [&](size_t lo, size_t hi, size_t i, uint32_t e, size_t mlen) {
+    std::function<void(size_t, size_t, size_t, uint32_t)> dfs =
+        [&](size_t lo, size_t hi, size_t i, uint32_t e) {
             if (i == 0) {
-                hits.push_back({lo, hi, mlen});
+                hits.emplace_back(lo, hi);
                 return;
             }
             auto key = std::make_tuple(lo, hi, i);
@@ -371,12 +368,12 @@ FMIndex::FuzzyMatchingDocs(const uint8_t* pat, size_t plen, uint32_t k) const {
                     size_t nlo, nhi;
                     step(static_cast<uint32_t>(tid), nlo, nhi);
                     if (nlo < nhi) {
-                        dfs(nlo, nhi, i - 1, e, mlen + 1);
+                        dfs(nlo, nhi, i - 1, e);
                     }
                 }
                 return;
             }
-            dfs(lo, hi, i - 1, e + 1, mlen);  // deletion: skip pat[i-1], no text
+            dfs(lo, hi, i - 1, e + 1);  // deletion: skip pat[i-1], no text char
             for (uint32_t d = 1; d < sigma_; ++d) {
                 if (static_cast<int32_t>(d) == sep_id_) {
                     continue;  // never edit toward the separator (stays in-doc)
@@ -387,45 +384,32 @@ FMIndex::FuzzyMatchingDocs(const uint8_t* pat, size_t plen, uint32_t k) const {
                     continue;
                 }
                 if (tid >= 0 && static_cast<uint32_t>(tid) == d) {
-                    dfs(nlo, nhi, i - 1, e, mlen + 1);  // match, no cost
+                    dfs(nlo, nhi, i - 1, e);  // match, no cost
                 } else {
-                    dfs(nlo, nhi, i - 1, e + 1, mlen + 1);  // substitution
+                    dfs(nlo, nhi, i - 1, e + 1);  // substitution
                 }
-                dfs(nlo, nhi, i, e + 1, mlen + 1);  // insertion: extra text char
+                dfs(nlo, nhi, i, e + 1);  // insertion: extra text char
             }
         };
-    dfs(0, m, plen, 0, 0);
+    dfs(0, m, plen, 0);
 
-    // A doc matches iff some matched T' lies fully inside it; attribute by T''s
-    // start position and require start+mlen <= that document's end boundary.
+    // Union the documents of every matched interval (each match is in-document).
     std::set<uint64_t> docset;
-    std::map<size_t, uint64_t> row_pos;  // cache row -> text position
+    std::set<size_t> seen_rows;
     for (auto& h : hits) {
-        for (size_t r = h.lo; r < h.hi; ++r) {
-            uint64_t pos;
-            auto c = row_pos.find(r);
-            if (c != row_pos.end()) {
-                pos = c->second;
-            } else {
-                size_t row = r;
-                uint64_t steps = 0;
-                while (!sampled_bv_.get(row)) {
-                    row = LF(row);
-                    ++steps;
-                }
-                pos = sa_sample_vals_[sampled_bv_.rank1(row)] + steps;
-                row_pos[r] = pos;
+        for (size_t r = h.first; r < h.second; ++r) {
+            if (!seen_rows.insert(r).second) {
+                continue;  // this row already resolved by another interval
             }
-            if (pos >= text_len_) {
-                continue;
+            size_t row = r;
+            uint64_t steps = 0;
+            while (!sampled_bv_.get(row)) {
+                row = LF(row);
+                ++steps;
             }
-            auto it = std::upper_bound(doc_start_.begin(), doc_start_.end(), pos);
-            uint64_t doc = static_cast<uint64_t>(it - doc_start_.begin()) - 1;
-            uint64_t doc_end = (doc + 1 < doc_start_.size())
-                                   ? doc_start_[doc + 1]
-                                   : text_len_;
-            if (pos + h.mlen <= doc_end) {  // T' fits inside the document
-                docset.insert(doc);
+            uint64_t pos = sa_sample_vals_[sampled_bv_.rank1(row)] + steps;
+            if (pos < text_len_) {
+                docset.insert(docOf(pos));
             }
         }
     }
@@ -875,6 +859,18 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         const uint64_t* dsp = align_view(n_docs * sizeof(uint64_t));
         doc_start_.resize(n_docs);
         std::memcpy(doc_start_.data(), dsp, n_docs * sizeof(uint64_t));
+        // doc_start_ must be a valid boundary list: start at 0, be strictly
+        // increasing (each document adds at least its separator), and end at
+        // text_len_. Otherwise docOf's upper_bound could underflow to a bogus
+        // document id and read c_/doc_start_ out of bounds during a query.
+        if (doc_start_.front() != 0 || doc_start_.back() != text_len_) {
+            return false;
+        }
+        for (size_t i = 1; i < doc_start_.size(); ++i) {
+            if (doc_start_[i] <= doc_start_[i - 1]) {
+                return false;
+            }
+        }
         buildDerived();  // id_to_byte_, isa_sample_ (in-RAM only)
         return true;
     } catch (const std::exception&) {

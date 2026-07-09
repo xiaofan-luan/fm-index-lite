@@ -1054,6 +1054,21 @@ TEST(FMIndex, DeserializeRejectsCorruptByteMap) {
     CHECK_EQ(bad.Count(bytes("banana"), 6), size_t(0));
 }
 
+TEST(FMIndex, DeserializeRejectsCorruptDocStart) {
+    FMIndex fm;
+    buildn(fm, {"alpha", "beta", "gamma"}, 4);
+    std::string blob = fm.Serialize();
+    // doc_start_ is the final section; its last uint64 is the end boundary
+    // (== internal text_len_). Corrupting it must be rejected, not read OOB via
+    // a bogus document id at query time.
+    CHECK(blob.size() >= 8);
+    uint64_t bogus = 0;  // != text_len_, and breaks the strictly-increasing rule
+    std::memcpy(&blob[blob.size() - 8], &bogus, sizeof(bogus));
+    FMIndex bad = FMIndex::Deserialize(blob);
+    CHECK(!bad.valid());
+    CHECK_EQ(bad.Count(bytes("alpha"), 5), size_t(0));
+}
+
 TEST(FMIndex, MappedOpenFailsOnCorruptFile) {
     std::string text = "the quick brown fox";
     FMIndex fm;

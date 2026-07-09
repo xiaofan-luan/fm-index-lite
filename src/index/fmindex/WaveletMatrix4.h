@@ -16,20 +16,19 @@ class WaveletMatrix4 {
  public:
     WaveletMatrix4() = default;
 
-    // seq holds symbols in [0, 4^qlevels). The element type S is chosen by the
-    // caller to fit sigma: uint16 for a byte alphabet (sigma <= 257 → half-size
-    // partition buffers, the build peak), uint32 for a large token alphabet.
-    // Takes seq by value: pass with std::move to build without copying it (the
-    // caller's buffer becomes the working array). Memory during construction is
-    // two n-element S buffers (cur + next, ping-ponged across levels) plus one
-    // n-byte digit array — not the 4 growable buckets of a naive partition.
-    template <class S>
-    WaveletMatrix4(std::vector<S> seq, uint32_t qlevels)
+    // seq holds symbols in [0, 4^qlevels). uint16 fits the byte alphabet
+    // (sigma <= 257, i.e. 256 bytes + separator/sentinel), which keeps the two
+    // partition buffers (the build memory peak) half-size. Takes seq by value:
+    // pass with std::move to build without copying it (the caller's buffer
+    // becomes the working array). Memory during construction is two n-element
+    // uint16 buffers (cur + next, ping-ponged across levels) plus one n-byte
+    // digit array — not the 4 growable buckets of a naive partition.
+    WaveletMatrix4(std::vector<uint16_t> seq, uint32_t qlevels)
         : n_(seq.size()), qlevels_(qlevels) {
         qv_.reserve(qlevels_);
         start_.assign(qlevels_, {0, 0, 0, 0});
-        std::vector<S> cur = std::move(seq);
-        std::vector<S> next(n_);
+        std::vector<uint16_t> cur = std::move(seq);
+        std::vector<uint16_t> next(n_);
         std::vector<uint8_t> digits(n_);
         for (uint32_t l = 0; l < qlevels_; ++l) {
             uint32_t shift = 2 * (qlevels_ - 1 - l);
