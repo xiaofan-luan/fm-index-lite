@@ -65,7 +65,14 @@ class BitVector {
                 }
                 size_t w = b * 8 + j;
                 if (w < nwords_) {
-                    rel += __builtin_popcountll(words_[w]);
+                    uint64_t word = words_[w];
+                    // Ignore padding bits past n_ in the last word — a VIEWED
+                    // (mmap'd) buffer may have stray high bits set, which would
+                    // otherwise inflate ones_ / count_ones().
+                    if (w + 1 == nwords_ && (n_ & 63)) {
+                        word &= (1ULL << (n_ & 63)) - 1;
+                    }
+                    rel += __builtin_popcountll(word);
                 }
             }
             dir_[2 * b + 1] = l2;

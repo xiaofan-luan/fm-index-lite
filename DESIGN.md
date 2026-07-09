@@ -215,7 +215,7 @@ level buys ~1% — deliberately not done. The two real levers:
 
 ## 7. Serialization format
 
-A flat little-endian blob (format v5): a header — magic `"FMIX"`, version,
+A flat little-endian blob (format v6): a header — magic `"FMIX"`, version,
 `sa_sample_rate`, `σ`, `qlevels`, a flags word (bit 0 = case-fold, bit 1 = 8-byte
 position storage; in the former alignment pad), `text_len`, the 256-entry
 `byte→id` map, the `uint64` C-table, per-level `start[4]`, then the section sizes
@@ -230,6 +230,20 @@ sampled-SA values serialize **4 bytes wide when the corpus is < 4 GiB, 8 above**
 (the flags bit), so a small corpus keeps a small index while >4 GiB stays
 representable; they are copied (not viewed) on load, so the width conversion is
 free.
+
+**Load robustness.** `Deserialize`/`LoadView` never crash or read out of bounds on
+any byte sequence — verified by an 8 K-iteration byte-flipping fuzz test under
+AddressSanitizer. `parseView` validates everything the query paths depend on:
+magic/version, `byte→id` entries in `[-1, σ)`, `qlevels` matching `σ`, every
+payload section size against `m`, the sampled bitmap's popcount against the sample
+count, every sampled-SA value `≤ text_len`, `doc_start` (starts at 0, strictly
+increasing, ends at `text_len`), and the wavelet `start[4]` offsets — which are
+**re-derived from the quad vectors** (the four digit counts always sum to `m`, so
+the derived offsets are `≤ m` and keep every descent in bounds) and rejected if the
+stored ones disagree. What load does *not* verify is corruption of the payload word
+arrays themselves: a metadata-consistent blob with corrupted wavelet/sampled words
+can load as `valid()` and return wrong answers. Byte integrity is the caller's
+responsibility (a storage-layer checksum); queries assume a structurally-valid index.
 
 ## 8. Performance summary (4 MB, arm64)
 
@@ -259,7 +273,7 @@ instance (guaranteed by the build-then-serve lifecycle). Verified: an 8-thread
 stress test agrees with single-threaded results and runs clean under
 ThreadSanitizer (`test/test_fmindex.cpp`).
 
-**mmap (zero-copy load).** The serialization format (v4) lays each large payload
+**mmap (zero-copy load).** The serialization format (v6) lays each large payload
 array — the quad wavelet words and the sampled-row bit words — at an 8-byte
 boundary, so they can be viewed in place from a memory mapping. `BitVector` and
 `QuadVector` store their words as a pointer + length that is either **owned**

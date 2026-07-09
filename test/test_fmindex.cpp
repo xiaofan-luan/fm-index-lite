@@ -4,6 +4,7 @@
 #include <map>
 #include <random>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1380,6 +1381,100 @@ TEST(FMIndex, MatchingDocsAndFuzzyVsOracle) {
         for (uint32_t k = 0; k <= 2; ++k)
             CHECK_EQ(rfm.FuzzyMatchingDocs(bytes(p), p.size(), k), rfuzzy(p, k));
     }
+}
+
+TEST(FMIndex, EmptyPatternDocApisReturnEmpty) {
+    FMIndex fm;
+    buildn(fm, {"error one", "error two", "warn"}, 2);
+    std::string empty;
+    const uint8_t* e = bytes(empty);
+    // The document-scoped queries all return no hits for an empty pattern
+    // (consistent with each other; a match at a separator is never reported).
+    CHECK(fm.LocateDocs(e, 0).empty());
+    CHECK(fm.MatchingDocs(e, 0).empty());
+    CHECK(fm.LocatePrefixDocs(e, 0).empty());
+    CHECK(fm.LocateSuffixDocs(e, 0).empty());
+    CHECK(fm.FuzzyMatchingDocs(e, 0, 1).empty());
+    // The raw Count of the empty pattern is still the position count (m).
+    CHECK_EQ(fm.Count(e, 0), fm.bwt_size());
+}
+
+TEST(FMIndex, BuildRejectsNulInDocument) {
+    std::string bad = "ab";
+    bad.push_back('\0');  // reserved separator byte inside a document
+    bad += "cd";
+    FMIndex fm;
+    bool threw = false;
+    try {
+        fm.Build(std::vector<std::string_view>{std::string_view(bad)}, 4);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST(FMIndex, FuzzyPatternWithNul) {
+    FMIndex fm;
+    buildn(fm, {"cat", "cab", "dog"}, 2);
+    // pattern "ca\0" contains the reserved separator; the '\0' is treated as a
+    // non-matching symbol (edit only), and the search never crosses a document.
+    std::string pat = "ca";
+    pat.push_back('\0');
+    // within edit distance 1 of "ca\0": "cat"(sub), "cab"(sub), "ca"(delete)
+    std::vector<uint64_t> expect = {0, 1};
+    CHECK_EQ(fm.FuzzyMatchingDocs(bytes(pat), pat.size(), 1), expect);
+    // an exact match of a NUL-containing pattern finds nothing (never the sep).
+    CHECK(fm.MatchingDocs(bytes(pat), pat.size()).empty());
+    CHECK_EQ(fm.Count(bytes(pat), pat.size()), size_t(0));
+}
+
+TEST(FMIndex, EmptyDocumentAmongNonEmpty) {
+    std::vector<std::string> docs = {"", "abc", "", "abcd", ""};
+    FMIndex fm;
+    buildn(fm, docs, 2);
+    std::vector<uint64_t> md = {1, 3};
+    CHECK_EQ(fm.MatchingDocs(bytes("abc"), 3), md);
+    CHECK_EQ(fm.LocatePrefixDocs(bytes("abc"), 3), md);
+    std::vector<uint64_t> sd = {1};  // "abc" ends doc 1, not doc 3 ("abcd")
+    CHECK_EQ(fm.LocateSuffixDocs(bytes("abc"), 3), sd);
+    // Extract on empty documents is empty; content docs come back intact.
+    CHECK(fm.Extract(0, 0, 5).empty());
+    CHECK(fm.Extract(2, 0, 5).empty());
+    CHECK(fm.Extract(4, 0, 5).empty());
+    CHECK_EQ(fm.Extract(1, 0, 5), std::string("abc"));
+    CHECK_EQ(fm.Extract(3, 1, 2), std::string("bc"));
+    // serialize round-trip preserves all of it (empty-doc boundaries included).
+    FMIndex fm2 = FMIndex::Deserialize(fm.Serialize());
+    CHECK(fm2.valid());
+    CHECK_EQ(fm2.MatchingDocs(bytes("abc"), 3), md);
+    CHECK_EQ(fm2.LocateSuffixDocs(bytes("abc"), 3), sd);
+    CHECK_EQ(fm2.Extract(1, 0, 5), std::string("abc"));
+}
+
+TEST(FMIndex, DeserializeRandomCorruptionNeverCrashes) {
+    // Contract: Deserialize / LoadView must never crash or read out of bounds on
+    // ANY byte sequence, and must reject a structurally-malformed blob. (A blob
+    // that passes validation but has corrupted PAYLOAD WORDS yields a live index
+    // whose answers may be wrong — byte integrity is the caller's job, e.g. a
+    // storage checksum — so we do not query the survivors here.) This exercises
+    // the parseView gauntlet: magic/version, byte_to_id_ range, qlevels vs sigma,
+    // section sizes, derived wavelet starts, sampled popcount, sampled-SA range,
+    // and doc_start monotonicity. Run under ASan to prove the no-OOB claim.
+    FMIndex fm;
+    buildn(fm, {"the quick brown", "fox jumps", "over the lazy dog"}, 4);
+    std::string good = fm.Serialize();
+    std::mt19937 rng(12345);
+    size_t survivors = 0;
+    for (int trial = 0; trial < 8000; ++trial) {
+        std::string blob = good;
+        int flips = 1 + rng() % 6;
+        for (int f = 0; f < flips; ++f) {
+            blob[rng() % blob.size()] ^= static_cast<char>(1 + rng() % 255);
+        }
+        FMIndex bad = FMIndex::Deserialize(blob);  // must never OOB/crash
+        if (bad.valid()) ++survivors;
+    }
+    CHECK(survivors <= 8000);  // reached here without a crash / sanitizer trip
 }
 
 int

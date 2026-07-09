@@ -42,6 +42,13 @@ FMIndex::Build(const std::vector<std::string_view>& docs, uint32_t sa_sample_rat
     doc_start_.clear();
     doc_start_.reserve(docs.size() + 1);
     for (const auto& d : docs) {
+        // '\0' is the reserved document separator; a document that contains it
+        // would forge a boundary and break the no-cross-document guarantee.
+        if (std::memchr(d.data(), '\0', d.size()) != nullptr) {
+            throw std::invalid_argument(
+                "FMIndex::Build: document contains a '\\0' byte (reserved as "
+                "the document separator)");
+        }
         doc_start_.push_back(buf.size());
         buf.insert(buf.end(), d.begin(), d.end());
         buf.push_back('\0');  // document separator
@@ -535,6 +542,10 @@ FMIndex::docOf(uint64_t internal_pos) const {
 
 std::vector<uint64_t>
 FMIndex::locateInternal(const uint8_t* pattern, size_t plen) const {
+    if (plen == 0) {
+        return {};  // empty pattern: no document-scoped hits (matches
+                    // FuzzyMatchingDocs); a raw Count still reports m positions.
+    }
     auto r = BackwardSearch(pattern, plen);
     std::vector<uint64_t> out;
     for (size_t i = r.first; i < r.second; ++i) {
@@ -761,6 +772,19 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         if (sigma_ == 0 || sigma_ > 257 || qlevels_ > 5) {
             return false;
         }
+        // qlevels_ must be exactly what Build derives from sigma_ (2 bits/level
+        // over ceil(log2(sigma_)) bits). A mismatched value would consume the
+        // wrong number of bits per symbol and silently alias distinct ids onto
+        // one wavelet path — wrong (but memory-safe) query answers.
+        {
+            uint32_t bits = 1;
+            while ((1u << bits) < sigma_) {
+                ++bits;
+            }
+            if (qlevels_ != (bits + 1) / 2) {
+                return false;
+            }
+        }
         text_len_ = get<uint64_t>(p, end);
         for (int i = 0; i < 256; ++i) {
             byte_to_id_[i] = get<int32_t>(p, end);
@@ -823,6 +847,20 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
             const uint64_t* w = align_view(qnw[l] * sizeof(uint64_t));
             qvs.push_back(QuadVector::from_view(m, w, qnw[l]));
         }
+        // The group-start offsets are fully determined by the quad vectors: the
+        // four per-level digit counts always sum to m, so the derived offsets are
+        // in [0, m] and keep every map_zero/map2/rank descent in bounds. Reject a
+        // blob whose stored `starts` disagree — otherwise a corrupt offset drives
+        // the wavelet descent off the QuadVector directory (heap OOB) right here
+        // in map_zero, before any query.
+        for (uint32_t l = 0; l < qlevels_; ++l) {
+            size_t c0 = qvs[l].rank(0, m), c1 = qvs[l].rank(1, m),
+                   c2 = qvs[l].rank(2, m);
+            std::array<size_t, 4> derived = {0, c0, c0 + c1, c0 + c1 + c2};
+            if (starts[l] != derived) {
+                return false;
+            }
+        }
         wm_ = WaveletMatrix4::from_parts(m, qlevels_, std::move(qvs),
                                          std::move(starts));
         first_.resize(sigma_);
@@ -831,6 +869,11 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         }
         const uint64_t* sw = align_view(sampled_nw * sizeof(uint64_t));
         sampled_bv_ = BitVector::from_view(m, sw, sampled_nw);
+        // The set-bit count must equal the number of sampled values; otherwise
+        // sa_sample_vals_[sampled_bv_.rank1(row)] could index past the array.
+        if (sampled_bv_.count_ones() != n_samples) {
+            return false;
+        }
         // small arrays copied (cheap, keeps them owned/aligned-independent)
         const size_t pw = wide_storage_ ? 8 : 4;
         const uint64_t* svp = align_view(n_samples * pw);
@@ -842,6 +885,13 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
             const uint32_t* s32 = reinterpret_cast<const uint32_t*>(svp);
             for (uint64_t i = 0; i < n_samples; ++i) {
                 sa_sample_vals_[i] = s32[i];
+            }
+        }
+        // Sampled values are text positions in [0, text_len_]; a larger value
+        // would drive buildDerived's isa_sample_[val/rate] write out of bounds.
+        for (uint64_t v : sa_sample_vals_) {
+            if (v > text_len_) {
+                return false;
             }
         }
         const uint64_t* dsp = align_view(n_docs * sizeof(uint64_t));

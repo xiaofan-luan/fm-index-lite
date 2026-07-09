@@ -33,7 +33,8 @@ class FMIndex {
     //
     //   docs            the documents, in order. Contents MUST NOT contain a
     //                   '\0' byte (that is the separator); valid UTF-8 never
-    //                   does. A UTF-8 CJK char counts as its 3 bytes. The total
+    //                   does — Build throws std::invalid_argument if one does.
+    //                   A UTF-8 CJK char counts as its 3 bytes. The total
     //                   internal size (sum of doc sizes + one byte per doc) must
     //                   be < 2^31 for the compact path, < 2^63 always; for larger
     //                   corpora, shard and build one index per shard.
@@ -80,7 +81,8 @@ class FMIndex {
 
     // Sorted (doc_id, offset_within_doc) of every occurrence. Because documents
     // are '\0'-separated internally, no occurrence can span two documents, so
-    // every hit is a genuine in-document match.
+    // every hit is a genuine in-document match. An empty pattern returns no hits
+    // (as do MatchingDocs / prefix / suffix / FuzzyMatchingDocs).
     std::vector<std::pair<uint64_t, uint64_t>>
     LocateDocs(const uint8_t* pattern, size_t plen) const;
 
@@ -202,11 +204,22 @@ class FMIndex {
     SerializeToFile(const std::string& path) const;
 
     // Copy the blob and load (owns its bytes).
+    //
+    // Robustness contract (both Deserialize and LoadView): loading NEVER crashes
+    // or reads out of bounds on any byte sequence, and a structurally-malformed
+    // blob is rejected — the returned index has valid()==false (and answers 0 to
+    // everything). This is verified by a byte-flipping fuzz test under ASan.
+    // What loading does NOT do: detect corruption of the payload WORD arrays
+    // (wavelet / sampled bitmap). A blob whose metadata is self-consistent but
+    // whose payload bytes are corrupted can load as valid() and then return
+    // wrong answers; guaranteeing byte integrity is the caller's job (e.g. a
+    // storage-layer checksum). Queries assume a structurally-valid index.
     static FMIndex
     Deserialize(const std::string& blob);
     // Zero-copy load: view serialized bytes at [base, base+size) (must be
     // 8-byte aligned, e.g. mmap). The caller keeps that memory alive for the
-    // index's lifetime; the large word arrays are not copied.
+    // index's lifetime; the large word arrays are not copied. Same robustness
+    // contract as Deserialize.
     static FMIndex
     LoadView(const uint8_t* base, size_t size);
 
