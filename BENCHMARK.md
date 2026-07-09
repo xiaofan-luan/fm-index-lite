@@ -3,6 +3,12 @@
 Apple Silicon (arm64), Apple clang 21 `-O2`, Rust 1.92 `--release`. Synthetic DNA
 (`{A,C,G,T}`) and word-like English text. Numbers below are the 4 MB corpus.
 
+> The 4 MB sweep and the sdsl/Lance comparison predate the document-scoped
+> refactor (`'\0'` separators). The **query** path — backward search — is
+> byte-identical, so those throughput numbers still hold; **build** differs only
+> by one extra corpus copy for separator injection (negligible at 4 MB). The
+> **1 GiB section** below was measured on the current code.
+
 ## What each column measures (read this first)
 
 | impl | what it is | query measured |
