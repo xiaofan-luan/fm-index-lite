@@ -47,6 +47,19 @@ buildn(FMIndex& fm, const std::vector<std::string>& docs, uint32_t rate = 32,
     fm.Build(v, rate, ci, fw);
 }
 
+// Sorted doc-local offsets of every occurrence. For a single-document index this
+// equals the plain text positions (every doc id is 0).
+static std::vector<uint64_t>
+offsets(const FMIndex& fm, const std::string& p) {
+    std::vector<uint64_t> v;
+    for (auto [doc, off] : fm.LocateDocs(bytes(p), p.size())) {
+        (void)doc;
+        v.push_back(off);
+    }
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
 // ---------- oracles ----------
 static std::vector<uint32_t>
 brute_sa(const std::vector<uint32_t>& s) {
@@ -241,8 +254,7 @@ TEST(FMIndex, LocateMatchesBruteForceAcrossSampleRates) {
         build1(fm, text, rate);
         for (std::string pat :
              {"a", "abra", "bra", "dab", "xyz", "abracadabra"}) {
-            CHECK_EQ(fm.Locate(bytes(pat), pat.size()),
-                     brute_positions(text, pat));
+            CHECK_EQ(offsets(fm, pat), brute_positions(text, pat));
         }
     }
 }
@@ -297,7 +309,7 @@ TEST(FMIndex, RandomizedFuzzVsBruteForce) {
                 ch = 'a' + (rng() % 5);  // 'e' never appears in text
             }
             CHECK_EQ(fm.Count(bytes(pat), plen), brute_count(text, pat));
-            CHECK_EQ(fm.Locate(bytes(pat), plen), brute_positions(text, pat));
+            CHECK_EQ(offsets(fm, pat), brute_positions(text, pat));
         }
     }
 }
@@ -353,12 +365,11 @@ TEST(FMIndex, DnaReadAlignment) {
     FMIndex fm;
     build1(fm, ref, 4);
     std::string read = "ACGT";
-    auto pos = fm.Locate(bytes(read), read.size());
+    auto pos = offsets(fm, read);
     CHECK_EQ(pos, brute_positions(ref, read));
     CHECK_EQ(pos.size(), 3u);
     std::string read2 = "TTGCA";
-    CHECK_EQ(fm.Locate(bytes(read2), read2.size()),
-             brute_positions(ref, read2));
+    CHECK_EQ(offsets(fm, read2), brute_positions(ref, read2));
 }
 
 // ---------- QuadVector direct ----------
@@ -433,7 +444,7 @@ TEST(FMIndex, EmptyCorpus) {
     fm.Build(std::vector<std::string_view>{}, 4);  // no documents at all
     CHECK_EQ(fm.Count(bytes(std::string("a")), 1), 0u);
     CHECK_EQ(fm.Count(bytes(std::string()), 0), 1u);  // empty matches 1 position
-    CHECK_EQ(fm.Locate(bytes(std::string("a")), 1).size(), 0u);
+    CHECK_EQ(fm.LocateDocs(bytes(std::string("a")), 1).size(), 0u);
     std::string blob = fm.Serialize();
     FMIndex fm2 = FMIndex::Deserialize(blob);
     CHECK_EQ(fm2.Count(bytes(std::string("a")), 1), 0u);
@@ -447,7 +458,7 @@ TEST(FMIndex, SingleCharAndAllSame) {
         CHECK_EQ(fm.Count(bytes(std::string("aa")), 2),
                  text.size() >= 2 ? text.size() - 1 : 0u);
         CHECK_EQ(fm.Count(bytes(std::string("b")), 1), 0u);
-        CHECK_EQ(fm.Locate(bytes(std::string("a")), 1).size(), text.size());
+        CHECK_EQ(fm.LocateDocs(bytes(std::string("a")), 1).size(), text.size());
     }
 }
 
@@ -473,8 +484,7 @@ TEST(FMIndex, FullByteAlphabetAndBinary) {
         size_t pos = rng2() % (text.size() - L);
         std::string pat = text.substr(pos, L);
         CHECK_EQ(fm.Count(bytes(pat), pat.size()), brute_count(text, pat));
-        CHECK_EQ(fm.Locate(bytes(pat), pat.size()),
-                 brute_positions(text, pat));
+        CHECK_EQ(offsets(fm, pat), brute_positions(text, pat));
     }
 }
 
@@ -701,8 +711,6 @@ TEST(FMIndex, LoadViewZeroCopyMatchesInRam) {
     for (std::string pat : {"the", "quick", "fox", "zzz", "the the"}) {
         CHECK_EQ(view.Count(bytes(pat), pat.size()),
                  fm.Count(bytes(pat), pat.size()));
-        CHECK_EQ(view.Locate(bytes(pat), pat.size()),
-                 fm.Locate(bytes(pat), pat.size()));
         CHECK_EQ(view.LocateDocs(bytes(pat), pat.size()),
                  fm.LocateDocs(bytes(pat), pat.size()));
     }
@@ -740,8 +748,8 @@ TEST(FMIndex, MmapFileRoundTrip) {
         for (std::string pat : {"the", "fox", "quick", "zzz", "the the"}) {
             CHECK_EQ(mapped->index().Count(bytes(pat), pat.size()),
                      fm.Count(bytes(pat), pat.size()));
-            CHECK_EQ(mapped->index().Locate(bytes(pat), pat.size()),
-                     fm.Locate(bytes(pat), pat.size()));
+            CHECK_EQ(mapped->index().LocateDocs(bytes(pat), pat.size()),
+                     fm.LocateDocs(bytes(pat), pat.size()));
         }
     }
     std::remove(path.c_str());
@@ -807,8 +815,8 @@ TEST(FMIndex, CaseInsensitiveMatch) {
     CHECK_EQ(fm.Count(bytes("FOX"), 3), size_t(2));
     CHECK_EQ(fm.Count(bytes("fox"), 3), size_t(2));
 
-    // Locate offsets still point into the ORIGINAL text.
-    auto pos = fm.Locate(bytes("the"), 3);
+    // Offsets still point into the ORIGINAL text.
+    auto pos = offsets(fm, "the");
     std::vector<uint64_t> expect = {0, 21};  // "The" at 0, "the" at 21
     CHECK_EQ(pos, expect);
 
@@ -906,11 +914,11 @@ TEST(FMIndex, ConcurrentQueriesMatchSingleThreaded) {
     }
     // ground truth (single-threaded)
     std::vector<size_t> truth_count(pats.size());
-    std::vector<std::vector<uint64_t>> truth_loc(pats.size());
+    std::vector<std::vector<std::pair<uint64_t, uint64_t>>> truth_loc(pats.size());
     std::vector<std::string> truth_ex(pats.size());
     for (size_t i = 0; i < pats.size(); ++i) {
         truth_count[i] = fm.Count(bytes(pats[i]), pats[i].size());
-        truth_loc[i] = fm.Locate(bytes(pats[i]), pats[i].size());
+        truth_loc[i] = fm.LocateDocs(bytes(pats[i]), pats[i].size());
         truth_ex[i] = fm.Extract(i % nd, 0, 10);
     }
 
@@ -924,7 +932,7 @@ TEST(FMIndex, ConcurrentQueriesMatchSingleThreaded) {
                 size_t i = lr() % pats.size();
                 if (fm.Count(bytes(pats[i]), pats[i].size()) != truth_count[i])
                     mismatches++;
-                if (fm.Locate(bytes(pats[i]), pats[i].size()) != truth_loc[i])
+                if (fm.LocateDocs(bytes(pats[i]), pats[i].size()) != truth_loc[i])
                     mismatches++;
                 if (fm.Extract(i % nd, 0, 10) != truth_ex[i])
                     mismatches++;
@@ -943,7 +951,6 @@ TEST(FMIndex, NoCrossDocumentMatches) {
 
     // "bc" would span the ab|cd seam: it simply does not exist in the index.
     CHECK_EQ(fm.Count(bytes("bc"), 2), size_t(0));
-    CHECK(fm.Locate(bytes("bc"), 2).empty());
     CHECK(fm.LocateDocs(bytes("bc"), 2).empty());
     CHECK(fm.MatchingDocs(bytes("bc"), 2).empty());
 
@@ -1134,8 +1141,6 @@ TEST(FMIndex, WideAndNarrowBuildsAgree) {
         for (size_t j = 0; j < pl; ++j) p += char('a' + rng() % 6);
         CHECK_EQ(narrow.Count(bytes(p), p.size()),
                  wide.Count(bytes(p), p.size()));
-        CHECK_EQ(narrow.Locate(bytes(p), p.size()),
-                 wide.Locate(bytes(p), p.size()));
         CHECK_EQ(narrow.LocateDocs(bytes(p), p.size()),
                  wide.LocateDocs(bytes(p), p.size()));
     }
@@ -1155,7 +1160,8 @@ TEST(FMIndex, WideStorageSurvivesRoundTrip) {
     CHECK(fm2.wide());  // flag round-tripped, read back 8-byte samples
     for (std::string p : {"the", "quick", "dog", "zzz", "o", "again"}) {
         CHECK_EQ(fm.Count(bytes(p), p.size()), fm2.Count(bytes(p), p.size()));
-        CHECK_EQ(fm.Locate(bytes(p), p.size()), fm2.Locate(bytes(p), p.size()));
+        CHECK_EQ(fm.LocateDocs(bytes(p), p.size()),
+                 fm2.LocateDocs(bytes(p), p.size()));
     }
     // Byte-identical re-serialization (deterministic wide layout).
     CHECK(fm2.Serialize() == blob);
@@ -1219,9 +1225,8 @@ TEST(FMIndex, MegabyteScaleVsNaiveOracle) {
         CHECK_EQ(counts32[i], want);                      // batched agrees
         auto want_pos = naive_pos(p);
         std::sort(want_pos.begin(), want_pos.end());
-        auto got = narrow.Locate(bytes(p), p.size());     // Locate already sorted
-        CHECK_EQ(got, want_pos);
-        CHECK_EQ(wide.Locate(bytes(p), p.size()), want_pos);
+        CHECK_EQ(offsets(narrow, p), want_pos);           // single doc: offset==pos
+        CHECK_EQ(offsets(wide, p), want_pos);
     }
     // Extract random windows against the source text (both paths).
     for (int q = 0; q < 200; ++q) {

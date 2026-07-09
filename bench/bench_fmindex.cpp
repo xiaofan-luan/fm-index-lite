@@ -88,7 +88,7 @@ main(int argc, char** argv) {
                 t0 = clk::now();
                 for (size_t i = 0; i < LN; ++i) {
                     volatile auto sz =
-                        fm.Locate(bytes(queries[i]), queries[i].size()).size();
+                        fm.LocateDocs(bytes(queries[i]), queries[i].size()).size();
                     (void)sz;
                 }
                 double locate_qps = LN / (ms_since(t0) / 1000.0);

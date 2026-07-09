@@ -71,7 +71,7 @@ using namespace milvus::index::fmindex;
 //      docs           your documents, in order (document i gets doc id i);
 //                     contents must not contain '\0'
 //      sa_sample_rate SA sampling rate: space/locate trade-off, no effect on
-//                     Count — default 32 is balanced; 4-8 = faster Locate,
+//                     Count — default 32 is balanced; 4-8 = faster LocateDocs,
 //                     bigger index; 64+ = smaller index if you only Count
 std::vector<std::string_view> docs = { "doc A text...", "doc B text...", ... };
 FMIndex fm;
@@ -114,7 +114,6 @@ calling `Count` in a loop. It is the right primitive for decontamination
 | `Build(docs, sa_sample_rate=32, case_insensitive=false)` | build over a list of documents (`std::vector<std::string_view>`) |
 | `Count(pat, len)` | per-document exact occurrence count |
 | `CountBatch(patterns)` | counts for many patterns, high throughput |
-| `Locate(pat, len)` | sorted positions (separator-free global offsets) |
 | `LocateDocs(pat, len)` | sorted `(doc_id, offset_within_doc)` of every occurrence |
 | `MatchingDocs(pat, len)` | sorted, unique **doc ids** containing `pat` (exact `LIKE '%pat%'`) |
 | `FuzzyMatchingDocs(pat, len, k)` | sorted, unique **doc ids** containing a substring within **edit distance ≤ k** of `pat` |
@@ -126,14 +125,14 @@ calling `Count` in a loop. It is the right primitive for decontamination
 | `Serialize()` / `SerializeToFile(path)` | persist the index |
 | `Deserialize(blob)` / `LoadView(base, size)` | load (copy / zero-copy mmap) |
 
-**Anchored matching.** `Count`/`Locate`/`MatchingDocs` find `pat` *anywhere* in a
+**Anchored matching.** `Count`/`LocateDocs`/`MatchingDocs` find `pat` *anywhere* in a
 document (substring). To match only at document boundaries — "log lines starting
 with `ERROR`", "files ending in `.log`" — use `LocatePrefixDocs` /
 `LocateSuffixDocs`; they return the sorted, unique document ids.
 
 **Case-insensitive.** Pass `case_insensitive=true` to `Build`: ASCII `A-Z` are folded
 to `a-z` at build time, so every query matches case-insensitively at **zero query-time
-cost** (`Locate` offsets still point into the original text). Only ASCII case is
+cost** (`LocateDocs` offsets still point into the original text). Only ASCII case is
 folded — non-ASCII / UTF-8 bytes stay exact.
 
 **Document-granularity filtering (for a scalar index).** A columnar filter wants a

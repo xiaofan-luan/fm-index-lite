@@ -78,13 +78,6 @@ class FMIndex {
     CountBatch(const std::vector<std::pair<const uint8_t*, size_t>>& patterns)
         const;
 
-    // Sorted positions of every occurrence, expressed as offsets into the
-    // separator-free concatenation of the documents (i.e. with the injected
-    // '\0's removed). Occurrences never span a document. Mostly for parity /
-    // debugging — LocateDocs is the document-aware primitive.
-    std::vector<uint64_t>
-    Locate(const uint8_t* pattern, size_t plen) const;
-
     // Sorted (doc_id, offset_within_doc) of every occurrence. Because documents
     // are '\0'-separated internally, no occurrence can span two documents, so
     // every hit is a genuine in-document match.

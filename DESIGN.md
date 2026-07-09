@@ -20,7 +20,6 @@ boundary in any operation** — including `Count`. This makes results document-s
 match interval. For any pattern `P` the index answers:
 
 - `Count(P)` — number of (per-document) occurrences of `P` (exact, no false positives).
-- `Locate(P)` — sorted positions as offsets into the separator-free concatenation.
 - `LocateDocs(P)` — sorted `(doc_id, offset_within_doc)` of every occurrence.
 - `MatchingDocs(P)` / `FuzzyMatchingDocs(P, k)` — sorted, unique doc ids that contain
   `P` exactly / within edit distance `k`.
@@ -127,12 +126,13 @@ matrix, C-table, `first_`, sampled SA + sampled-row `BitVector`, `doc_start`.
 If `lo ≥ hi`, no match. After the last byte, **`hi − lo` is the occurrence count**
 (the interval width). `first_[c]` cancels the wavelet-matrix group-start baseline.
 
-**Locate.** For each row `i ∈ [lo, hi)`, walk LF-mapping
+**locateInternal.** For each row `i ∈ [lo, hi)`, walk LF-mapping
 (`LF(i) = C[BWT[i]] + rank(BWT[i], i)`, with `BWT[i] = wm.access(i)`) until a
 **sampled** row is reached (the sampled-row `BitVector`'s rank gives the index into
 `sa_sample_vals`), then `pos = sampled_value + steps`. Positions ≥ `n` (the
 sentinel seat) are dropped. Sampling every `k`-th SA value trades index size for
-locate latency.
+locate latency. This yields internal (separator-injected) coordinates, shared by
+`LocateDocs` and the prefix/suffix queries.
 
 `doc_start` here is the **internal** boundary array (offsets into the separator-
 injected buffer), size `n_docs+1` with a trailing end sentinel: document `d`'s
@@ -141,11 +141,9 @@ The separator is a dense-alphabet id (`sep_id_ = byte_to_id_['\0']`) that backwa
 search rejects on entry, so a query never steps onto it — cross-document substrings
 therefore do not exist in the index and no boundary filtering is needed.
 
-**Locate / LocateDocs.** `locateInternal` returns occurrence positions in internal
-coordinates; public `Locate` subtracts the document index (`internal_pos − docOf`)
-to give offsets into the separator-free concatenation. `LocateDocs` maps each to
-`(docOf(pos), pos − doc_start[doc])`. No spill check is needed — an occurrence can
-never cross a separator.
+**LocateDocs.** Maps each internal occurrence position to
+`(docOf(pos), pos − doc_start[doc])`, where `docOf` is `upper_bound(doc_start, pos) − 1`.
+No spill check is needed — an occurrence can never cross a separator.
 
 **PrefixDocs / SuffixDocs.** `LocatePrefixDocs` keeps hits whose internal position is
 exactly a `doc_start` (the occurrence sits at a document's start); `LocateSuffixDocs`
@@ -301,9 +299,9 @@ page-fault sweep on the cold first pass.
 `src/index/fmindex/*` moves to `internal/core/src/index/` unchanged (same
 `milvus::index::fmindex` namespace, `#include "index/fmindex/..."`). `libsais`
 (Apache-2.0) is vendored. The Milvus scalar-index wrapper registers
-`ScalarIndexType::FMINDEX`, serves `InnerMatch` (`LIKE '%x%'`) via `Count`/`Locate`,
+`ScalarIndexType::FMINDEX`, serves `InnerMatch` (`LIKE '%x%'`) via `MatchingDocs`,
 and exposes `CountBatch` for bulk decontamination. Per-segment build over the
-column's concatenated row values + `doc_start`; queries fan out and aggregate.
+column's row values (one document per row); queries fan out and aggregate.
 
 ## 10. Limitations / future
 

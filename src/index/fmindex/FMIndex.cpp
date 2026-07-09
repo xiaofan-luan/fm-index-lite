@@ -553,18 +553,6 @@ FMIndex::locateInternal(const uint8_t* pattern, size_t plen) const {
     return out;
 }
 
-std::vector<uint64_t>
-FMIndex::Locate(const uint8_t* pattern, size_t plen) const {
-    std::vector<uint64_t> pos = locateInternal(pattern, plen);
-    // Map to offsets in the separator-free concatenation: doc d's content is
-    // preceded by exactly d injected separators, so subtract d. The map is
-    // strictly monotone, so the result stays sorted.
-    for (uint64_t& p : pos) {
-        p -= docOf(p);
-    }
-    return pos;
-}
-
 std::vector<std::pair<uint64_t, uint64_t>>
 FMIndex::LocateDocs(const uint8_t* pattern, size_t plen) const {
     std::vector<uint64_t> positions = locateInternal(pattern, plen);
