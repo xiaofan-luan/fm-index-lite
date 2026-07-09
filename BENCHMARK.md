@@ -78,6 +78,36 @@ speed and isn't pursued — the target is general text.)
 - Note: our rank9 directory (~25% overhead) lives **in RAM only** — it is rebuilt
   on load and not serialized, so it does not affect the on-disk ratios above.
 
+## At scale: 1 GiB, document-scoped (`bench_gig`)
+
+A single index over **1 GiB** of word-like text, split into **1,048,576 documents**
+of ~1 KiB each (the document-scoped path: `'\0'` separators injected, so every query
+is per-document). Apple Silicon (48 GB), `-O2`, single-threaded build (OpenMP off),
+`sa_sample_rate = 32`. Queries are 20,000 length-16 substrings drawn from within
+single documents.
+
+| phase | result |
+|---|---|
+| **build** | **44.6 s**, peak RSS **9.07 GB** (≈9.1× corpus) |
+| **index size** | **1.01 GB on disk** (1.01× corpus), serialize 1.0 s |
+| **Count** (single) | 7.3 µs/query — **137 K qps** |
+| **CountBatch** (bulk) | 1.0 µs/query — **~1.0 M qps** (7.4× single) |
+| **LocateDocs** | 19.6 µs/query — 51 K qps |
+| **MatchingDocs** (`LIKE '%x%'`) | 19.7 µs/query — 51 K qps |
+| **FuzzyMatchingDocs** (k=1) | 0.46 ms/query — 2.2 K qps |
+| **Extract** (64 B) | 63 µs/call — 16 K qps |
+
+- **Build memory ≈9.1× is the process peak, which includes the ~1 GB source
+  documents held resident**; the index construction's own working set is ~8× (32-bit
+  suffix array = 4 B/byte + uint16 BWT + wavelet + sampling). For larger corpora,
+  build one index per shard/segment; shards build concurrently (~4.4× on 8 threads),
+  or enable `-DFMINDEX_OPENMP=ON` for the SA step.
+- **Index is 1.01× the corpus** — the rank9 directory is rebuilt on load (RAM-only,
+  not serialized), so it doesn't count against the on-disk size.
+- Random 16-grams are essentially unique in 1 GiB, so each query has one hit;
+  `LocateDocs`/`MatchingDocs` latency is dominated by the single LF-walk to a sampled
+  position (≤ `sa_sample_rate` steps). Patterns with many hits scale with hit count.
+
 ## Scorecard vs sdsl (the apples-to-apples reference)
 
 | axis | verdict |
@@ -116,8 +146,9 @@ queries throughout development.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4
-./build/bench_fmindex     # ours: build / count / batch / locate / size
+./build/bench_fmindex     # ours: build / count / batch / locate / size (4 MB sweep)
 ./build/bench_mmap        # in-RAM vs mmap query throughput
+./build/bench_gig [GiB]   # 1 GiB (default) document-scoped build + query, peak RSS
 ```
 
 The sdsl-lite (`csa_wt`) and Lance (`lancedb` 0.31, `Index::Fm`) numbers above were

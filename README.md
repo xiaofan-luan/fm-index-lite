@@ -187,9 +187,14 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
 ./build/test_fmindex     # unit tests: fuzz vs brute force, concurrency, Extract, 32/64-bit, corrupt-blob
 ./build/demo             # tiny walkthrough of the anchored + case-insensitive API
-./build/bench_fmindex    # build / count / batch / locate / size
+./build/bench_fmindex    # build / count / batch / locate / size (4 MB sweep)
 ./build/bench_mmap       # in-RAM vs mmap query throughput
+./build/bench_gig [GiB]  # 1 GiB document-scoped build + query, peak RSS
 ```
+
+Measured numbers — the 4 MB sweep vs sdsl-lite and a **1 GiB document-scoped run**
+(build 44.6 s, index 1.01× corpus, Count 137 K qps / batched ~1 M qps) — are in
+[`BENCHMARK.md`](BENCHMARK.md).
 
 ## Layout
 
@@ -197,9 +202,9 @@ cmake --build build -j4
 src/index/fmindex/   the library (headers + FMIndex.cpp); ports into Milvus core
 third_party/libsais/ vendored suffix-array builder, 32- and 64-bit (Apache-2.0)
 test/                dependency-free brute-force-oracle tests
-bench/               self-contained benchmark harnesses (build / count / mmap)
+bench/               self-contained benchmark harnesses (4 MB sweep, mmap, 1 GiB)
 DESIGN.md            architecture, algorithms, correctness, serialization format
-BENCHMARK.md         measured numbers vs sdsl-lite and Lance
+BENCHMARK.md         measured numbers: 4 MB vs sdsl-lite/Lance, and a 1 GiB run
 ```
 
 ## Licensing
