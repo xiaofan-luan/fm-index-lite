@@ -102,6 +102,14 @@ class FMIndex {
         return LocateSuffixDocs(pattern, plen).size();
     }
 
+    // Recover the original bytes T[pos, pos+len) from the index — e.g. to show
+    // the context around a match found via Locate. O(len + sa_sample_rate) LF
+    // steps; no forward navigation needed. If the index was built with
+    // case_insensitive=true, ASCII letters come back lowercased (original case
+    // is not stored). Returns fewer than len bytes if pos+len exceeds the text.
+    std::string
+    Extract(uint64_t pos, size_t len) const;
+
     // --- accessors used by tests ---
     size_t
     bwt_size() const {
@@ -147,6 +155,11 @@ class FMIndex {
  private:
     size_t
     LF(size_t i) const;
+    // Rebuild the in-RAM-only structures derived from the serialized fields:
+    // id_to_byte_ (from byte_to_id_) and isa_sample_ (from sampled_bv_ +
+    // sa_sample_vals_). Called after Build and after a load.
+    void
+    buildDerived();
     // Fill *this by viewing serialized bytes at base; the wavelet/sampled word
     // arrays are viewed, the small sample/doc arrays are copied. Returns false
     // on a truncated/corrupt/incompatible blob.
@@ -170,6 +183,9 @@ class FMIndex {
     // sample storage vs uint64 with no query cost — plain array load either way.
     std::vector<uint32_t> sa_sample_vals_;
     std::vector<uint64_t> doc_start_;  // document boundaries
+    // Derived, in-RAM only (rebuilt on load, never serialized):
+    std::vector<uint8_t> id_to_byte_;    // dense id -> byte (inverse of byte_to_id_)
+    std::vector<uint32_t> isa_sample_;   // isa_sample_[k] = row whose SA value = k*rate
     std::vector<uint8_t> owned_blob_;  // backs the views when Deserialized by copy
 };
 

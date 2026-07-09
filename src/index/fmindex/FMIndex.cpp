@@ -102,6 +102,66 @@ FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate,
     }
     samp.build_rank();
     sampled_bv_ = std::move(samp);
+
+    buildDerived();
+}
+
+void
+FMIndex::buildDerived() {
+    // id -> byte (inverse of byte_to_id_). For a case-folded index both 'A' and
+    // 'a' map to one id; ascending iteration lets lowercase win, so Extract
+    // returns the canonical lowercase byte.
+    id_to_byte_.assign(sigma_, 0);
+    for (int b = 0; b < 256; ++b) {
+        if (byte_to_id_[b] > 0) {
+            id_to_byte_[byte_to_id_[b]] = static_cast<uint8_t>(b);
+        }
+    }
+    // isa_sample_[k] = the BWT row whose suffix starts at text position k*rate.
+    // Every multiple of rate in [0, text_len_] appears exactly once in the SA,
+    // so this array is fully populated. Gives Extract an anchor within `rate`
+    // steps of any position without needing select/psi.
+    const size_t m = text_len_ + 1;
+    isa_sample_.assign(text_len_ / sa_sample_rate_ + 1, 0);
+    for (size_t r = 0; r < m; ++r) {
+        if (sampled_bv_.get(r)) {
+            uint32_t val = sa_sample_vals_[sampled_bv_.rank1(r)];
+            isa_sample_[val / sa_sample_rate_] = static_cast<uint32_t>(r);
+        }
+    }
+}
+
+std::string
+FMIndex::Extract(uint64_t pos, size_t len) const {
+    if (c_.empty() || pos >= text_len_) {
+        return {};
+    }
+    uint64_t end = pos + std::min<uint64_t>(len, text_len_ - pos);
+    // Anchor: a row whose suffix starts at a sampled position >= end, then walk
+    // backward (LF) collecting BWT chars, which are the text bytes before each
+    // row's suffix. Prefer the nearest sample above `end`; fall back to row 0
+    // (the sentinel suffix, which starts at text_len_) when none exists.
+    uint64_t k = (end + sa_sample_rate_ - 1) / sa_sample_rate_;  // ceil(end/rate)
+    size_t row;
+    uint64_t p;
+    if (k < isa_sample_.size()) {
+        row = isa_sample_[k];
+        p = k * sa_sample_rate_;
+    } else {
+        row = 0;  // SA[0] is the sentinel-only suffix, starting at text_len_
+        p = text_len_;
+    }
+    std::string out(static_cast<size_t>(end - pos), '\0');
+    while (p > pos) {
+        uint32_t sym = wm_.access(row);  // BWT[row] = T[p-1]
+        if (p - 1 < end) {
+            out[static_cast<size_t>(p - 1 - pos)] =
+                static_cast<char>(id_to_byte_[sym]);
+        }
+        row = LF(row);
+        --p;
+    }
+    return out;
 }
 
 size_t
@@ -480,6 +540,7 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         const uint64_t* dsp = align_view(n_docs * sizeof(uint64_t));
         doc_start_.resize(n_docs);
         std::memcpy(doc_start_.data(), dsp, n_docs * sizeof(uint64_t));
+        buildDerived();  // id_to_byte_, isa_sample_ (in-RAM only)
         return true;
     } catch (const std::exception&) {
         return false;

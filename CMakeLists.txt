@@ -10,6 +10,8 @@ endif()
 
 add_compile_options(-O2 -Wall -Wextra)
 
+find_package(Threads REQUIRED)
+
 # Include root mirrors Milvus (internal/core/src) so headers are included as
 # "index/fmindex/...", making the eventual port a straight copy.
 include_directories(${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}
@@ -21,7 +23,7 @@ add_library(fmindex STATIC
 
 add_executable(test_fmindex test/test_fmindex.cpp)
 target_include_directories(test_fmindex PRIVATE ${CMAKE_SOURCE_DIR}/test)
-target_link_libraries(test_fmindex PRIVATE fmindex)
+target_link_libraries(test_fmindex PRIVATE fmindex Threads::Threads)
 
 add_executable(bench_fmindex bench/bench_fmindex.cpp)
 target_link_libraries(bench_fmindex PRIVATE fmindex)

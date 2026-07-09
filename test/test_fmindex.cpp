@@ -1,7 +1,9 @@
 // Licensed to the LF AI & Data foundation under Apache-2.0.
 #include <algorithm>
+#include <atomic>
 #include <random>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -844,6 +846,105 @@ TEST(FMIndex, CaseInsensitiveSurvivesRoundTrip) {
     for (std::string pat : {"hello", "HELLO", "World", "WORLD"}) {
         CHECK_EQ(fm2.Count(bytes(pat), pat.size()), size_t(2));
     }
+}
+
+TEST(FMIndex, ExtractMatchesOriginal) {
+    std::mt19937 rng(99);
+    for (int trial = 0; trial < 60; ++trial) {
+        size_t n = 1 + rng() % 500;
+        std::string text(n, 'a');
+        for (auto& ch : text) ch = 'a' + (rng() % 6);  // small alphabet, repeats
+        uint32_t rate = 1 + rng() % 20;
+        FMIndex fm;
+        fm.Build(bytes(text), text.size(), rate);
+        // random windows, including edges and over-long lengths
+        for (int q = 0; q < 30; ++q) {
+            uint64_t pos = rng() % n;
+            size_t len = rng() % (n + 5);
+            std::string got = fm.Extract(pos, len);
+            size_t want_len = std::min<size_t>(len, n - pos);
+            CHECK_EQ(got, text.substr(pos, want_len));
+        }
+        // whole-text extraction
+        CHECK_EQ(fm.Extract(0, n), text);
+        // out-of-range
+        CHECK(fm.Extract(n, 5).empty());
+    }
+}
+
+TEST(FMIndex, ExtractContextAroundMatchAfterLoad) {
+    std::string text = "the quick brown fox jumps over the lazy dog";
+    FMIndex fm;
+    fm.Build(bytes(text), text.size(), 4);
+    std::string blob = fm.Serialize();
+    FMIndex fm2 = FMIndex::Deserialize(blob);  // derived structs rebuilt on load
+
+    for (std::string pat : {"quick", "fox", "the", "dog"}) {
+        auto pos = fm2.Locate(bytes(pat), pat.size());
+        CHECK(!pos.empty());
+        for (uint64_t p : pos) {
+            // the extracted window at the match equals the pattern
+            CHECK_EQ(fm2.Extract(p, pat.size()), pat);
+            // and a little context on each side matches the original text
+            uint64_t start = p >= 3 ? p - 3 : 0;
+            size_t clen = std::min<size_t>(pat.size() + 6, text.size() - start);
+            CHECK_EQ(fm2.Extract(start, clen), text.substr(start, clen));
+        }
+    }
+}
+
+TEST(FMIndex, ConcurrentQueriesMatchSingleThreaded) {
+    // Build one immutable index, hammer it from many threads, and check every
+    // thread's answers equal the single-threaded ground truth (verifies the
+    // const/lock-free query claim: no data races, no shared mutable state).
+    std::mt19937 rng(7);
+    std::string text;
+    std::vector<uint64_t> starts;
+    for (int d = 0; d < 400; ++d) {
+        starts.push_back(text.size());
+        size_t dl = 5 + rng() % 40;
+        for (size_t i = 0; i < dl; ++i) text += char('a' + rng() % 8);
+    }
+    FMIndex fm;
+    fm.Build(bytes(text), text.size(), 8);
+    fm.SetDocStarts(starts);
+
+    std::vector<std::string> pats;
+    for (int i = 0; i < 64; ++i) {
+        size_t pl = 1 + rng() % 5;
+        std::string p;
+        for (size_t j = 0; j < pl; ++j) p += char('a' + rng() % 8);
+        pats.push_back(p);
+    }
+    // ground truth (single-threaded)
+    std::vector<size_t> truth_count(pats.size());
+    std::vector<std::vector<uint64_t>> truth_loc(pats.size());
+    std::vector<std::string> truth_ex(pats.size());
+    for (size_t i = 0; i < pats.size(); ++i) {
+        truth_count[i] = fm.Count(bytes(pats[i]), pats[i].size());
+        truth_loc[i] = fm.Locate(bytes(pats[i]), pats[i].size());
+        truth_ex[i] = fm.Extract(i * 3 % text.size(), 10);
+    }
+
+    const int kThreads = 8;
+    std::atomic<int> mismatches{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < kThreads; ++t) {
+        ts.emplace_back([&, t]() {
+            std::mt19937 lr(1000 + t);
+            for (int iter = 0; iter < 300; ++iter) {
+                size_t i = lr() % pats.size();
+                if (fm.Count(bytes(pats[i]), pats[i].size()) != truth_count[i])
+                    mismatches++;
+                if (fm.Locate(bytes(pats[i]), pats[i].size()) != truth_loc[i])
+                    mismatches++;
+                if (fm.Extract(i * 3 % text.size(), 10) != truth_ex[i])
+                    mismatches++;
+            }
+        });
+    }
+    for (auto& th : ts) th.join();
+    CHECK_EQ(mismatches.load(), 0);
 }
 
 int

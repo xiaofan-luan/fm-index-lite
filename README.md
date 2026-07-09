@@ -113,6 +113,7 @@ calling `Count` in a loop. It is the right primitive for decontamination
 | `LocateDocs(pat, len)` | sorted `(doc_id, offset)` of every occurrence |
 | `LocatePrefixDocs(pat, len)` / `CountPrefixDocs` | documents that **begin** with `pat` |
 | `LocateSuffixDocs(pat, len)` / `CountSuffixDocs` | documents that **end** with `pat` |
+| `Extract(pos, len)` | recover the original bytes `T[pos, pos+len)` (match context) |
 | `Serialize()` / `SerializeToFile(path)` | persist the index |
 | `Deserialize(blob)` / `LoadView(base, size)` | load (copy / zero-copy mmap) |
 
@@ -126,10 +127,16 @@ to `a-z` at build time, so every query matches case-insensitively at **zero quer
 cost** (`Locate` offsets still point into the original text). Only ASCII case is
 folded — non-ASCII / UTF-8 bytes stay exact.
 
+**Match context.** `Extract(pos, len)` rebuilds the original bytes from the index
+(no need to keep the source text around) — e.g. to show the line around a hit from
+`Locate`. Costs `O(len + sa_sample_rate)`. On a `case_insensitive` index, ASCII
+letters come back lowercased (original case isn't stored).
+
 **Concurrency:** all queries are `const` and lock-free — many threads may query one
-index at once. **Immutable:** build-once; to update, rebuild (or, at scale, add a
-new shard and mask deletes at query time). **Serving:** `LoadView` maps the index
-zero-copy from an mmap'd file — warm query throughput equals in-RAM.
+index at once (verified: an 8-thread stress test matches single-threaded results and
+is ThreadSanitizer-clean). **Immutable:** build-once; to update, rebuild (or, at
+scale, add a new shard and mask deletes at query time). **Serving:** `LoadView` maps
+the index zero-copy from an mmap'd file — warm query throughput equals in-RAM.
 
 Not supported (by design): regex, arbitrary lexicographic range between two different
 strings (needs forward navigation), incremental update, Unicode-aware case folding.
@@ -139,7 +146,7 @@ strings (needs forward navigation), incremental update, Unicode-aware case foldi
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
-./build/test_fmindex     # 39 tests / 380k checks
+./build/test_fmindex     # 42 tests / 383k checks (incl. concurrency + Extract fuzz)
 ./build/demo             # tiny walkthrough of the anchored + case-insensitive API
 ./build/bench_fmindex    # build / count / batch / locate / size
 ./build/bench_mmap       # in-RAM vs mmap query throughput

@@ -58,5 +58,15 @@ int main() {
         printf("%s%llu", i ? "," : "", (unsigned long long)pos[i]);
     printf("}  (0 = \"ERROR\", %llu = \"error\")\n",
            pos.size() > 1 ? (unsigned long long)pos[1] : 0);
+
+    printf("\n-- Extract: rebuild context around a match from the index --\n");
+    for (uint64_t p : pos) {
+        uint64_t start = p >= 6 ? p - 6 : 0;
+        std::string ctx = fm.Extract(start, 20);
+        printf("  match@%2llu -> \"...%s...\"\n", (unsigned long long)p,
+               ctx.c_str());
+    }
+    printf("  (letters are lowercased here because the index is "
+           "case-insensitive)\n");
     return 0;
 }

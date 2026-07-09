@@ -22,6 +22,9 @@ index answers, for any pattern `P`:
 - `LocatePrefixDocs(P)` / `LocateSuffixDocs(P)` — documents that begin / end with
   `P` (anchored match): occurrences that land on a document boundary, obtained by
   filtering `Locate` against `doc_start` — no extra structure.
+- `Extract(pos, len)` — recover the original bytes `T[pos, pos+len)` from the index
+  (match context) in `O(len + sample_rate)` LF steps, using an inverse-sample anchor
+  (`isa_sample_`) — no forward navigation / `select` needed. See §4.
 
 Matching is **byte-exact** by default. Build with `case_insensitive=true` to fold
 ASCII `A-Z→a-z` at build time (both cases share one dense-alphabet symbol, so
@@ -123,6 +126,20 @@ locate latency.
 **LocateDocs.** `upper_bound(doc_start, pos) − 1` gives the document; offset is
 `pos − doc_start[doc_id]`.
 
+**PrefixDocs / SuffixDocs.** `LocatePrefixDocs` keeps the `Locate` hits whose
+position is exactly a `doc_start` (the occurrence sits at a document's start);
+`LocateSuffixDocs` keeps those whose end `pos+plen` equals the document's end
+boundary. Both are pure filters over `Locate` — robust whether or not the pattern
+occurs elsewhere, and needing no extra structure.
+
+**Extract.** To recover `T[pos, pos+len)` without keeping the source text, LF only
+walks *backward*, so we anchor at a sampled position `≥ pos+len` and walk down to
+`pos`, emitting `BWT[row] = wm.access(row)` (the byte before each row's suffix) via
+`id_to_byte_`. The anchor comes from `isa_sample_[k]` — the row whose SA value is
+`k·rate` — an inverse of the SA sampling built on load (in-RAM only, same size as
+`sa_sample_vals`). Cost is `O(len + rate)` LF steps; no `select`/ψ needed. On a
+case-folded index the recovered letters are lowercase (original case isn't stored).
+
 **CountBatch (throughput).** The workload is latency-bound: each `rank` is a
 data-dependent cache miss and the core would otherwise idle. `CountBatch` runs
 patterns in **tiles of 32**, advancing all active patterns one character per round
@@ -190,11 +207,14 @@ returned rows/positions (the index is untouched); **reclamation** happens throug
 segment compaction rebuilding the index — all existing Milvus machinery.
 
 **Concurrency: lock-free reads.** Every query method (`Count`, `BackwardSearch`,
-`Locate`, `LocateDocs`, `CountBatch`) is `const` and pure-read; `CountBatch`'s
-scratch buffers are function-local, so it is re-entrant. There is no mutable
-cache, lazy init, or shared state, so **many threads may query concurrently
-without locks**, provided no thread is building/deserializing the same instance
-(guaranteed by the build-then-serve lifecycle).
+`Locate`, `LocateDocs`, `CountBatch`, `Extract`) is `const` and pure-read;
+`CountBatch`'s scratch buffers are function-local, so it is re-entrant. There is no
+mutable cache, lazy init, or shared state (the derived `id_to_byte_`/`isa_sample_`
+are built once at load and only read after), so **many threads may query
+concurrently without locks**, provided no thread is building/deserializing the same
+instance (guaranteed by the build-then-serve lifecycle). Verified: an 8-thread
+stress test agrees with single-threaded results and runs clean under
+ThreadSanitizer (`test/test_fmindex.cpp`).
 
 **mmap (zero-copy load).** The serialization format (v4) lays each large payload
 array — the quad wavelet words and the sampled-row bit words — at an 8-byte
