@@ -270,11 +270,12 @@ column's concatenated row values + `doc_start`; queries fan out and aggregate.
 ## 10. Limitations / future
 
 - **Corpus `< 2^63` bytes** per index (32-bit SA under 2 GiB, `libsais64` above;
-  positions stored 4 or 8 bytes by size). In practice **build memory** (~30× the
-  corpus, dominated by the transient SA) is the real ceiling long before 2^63, so
-  the per-segment shard model stays the way to scale — reducing build memory is
-  the open item (byte-SA already lands the text copy; the wavelet build buffers
-  and the int64 SA are next).
+  positions stored 4 or 8 bytes by size). In practice **build memory** (~12× the
+  corpus on the 32-bit path) is the real ceiling long before 2^63, so the
+  per-segment shard model stays the way to scale. Peak now sits at the wavelet
+  build (two n-element uint32 partition buffers); a `#define FMIX_BUILD_MEM_PROFILE`
+  logs per-phase peak RSS. Further cuts (uint16 partition buffers, in-place radix)
+  are open items.
 - **DNA size** is behind sdsl; closing it (sentinel removal → 2 quad levels, or a
   bwa-mem2-style 2-bit occ) costs effort for a non-target workload.
 - **Repetitive corpora**: an r-index (RLBWT) could be ~10× smaller on heavily

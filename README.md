@@ -48,7 +48,7 @@ doc_start   = [ 0,           13,           26 ]   // byte offset where each doc 
   32-bit indices under 2 GiB (compact, less build memory) and 64-bit indices at or
   above it — chosen automatically from `len`. Sampled positions likewise serialize
   4 bytes wide under 4 GiB, 8 above, so a small corpus keeps a small index. Going
-  past 2 GiB in one index is mostly limited by **build memory** (~30× the corpus),
+  past 2 GiB in one index is mostly limited by **build memory** (~12× the corpus),
   so for large data prefer one index per shard/segment (this is how it plugs into
   Milvus, one index per sealed segment).
 - **Document boundaries are respected on attribution.** Because documents are

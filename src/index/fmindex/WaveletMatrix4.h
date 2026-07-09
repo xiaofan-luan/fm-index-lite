@@ -17,13 +17,17 @@ class WaveletMatrix4 {
     WaveletMatrix4() = default;
 
     // seq holds symbols in [0, 4^qlevels). qlevels = ceil(log2(sigma)/2).
-    WaveletMatrix4(const std::vector<uint32_t>& seq, uint32_t qlevels)
+    // Takes seq by value: pass with std::move to build without copying it (the
+    // caller's buffer becomes the working array). Memory during construction is
+    // two n-element uint32 buffers (cur + next, ping-ponged across levels) plus
+    // one n-byte digit array — not the 4 growable buckets of a naive partition.
+    WaveletMatrix4(std::vector<uint32_t> seq, uint32_t qlevels)
         : n_(seq.size()), qlevels_(qlevels) {
         qv_.reserve(qlevels_);
         start_.assign(qlevels_, {0, 0, 0, 0});
-        std::vector<uint32_t> cur = seq;
+        std::vector<uint32_t> cur = std::move(seq);
+        std::vector<uint32_t> next(n_);
         std::vector<uint8_t> digits(n_);
-        std::array<std::vector<uint32_t>, 4> bucket;
         for (uint32_t l = 0; l < qlevels_; ++l) {
             uint32_t shift = 2 * (qlevels_ - 1 - l);
             std::array<size_t, 4> hist{0, 0, 0, 0};
@@ -37,19 +41,14 @@ class WaveletMatrix4 {
             start_[l][1] = hist[0];
             start_[l][2] = hist[0] + hist[1];
             start_[l][3] = hist[0] + hist[1] + hist[2];
-            // stable partition cur into the 4 digit groups, order preserved
-            for (auto& b : bucket) {
-                b.clear();
-            }
+            // Stable counting-sort scatter cur -> next by digit (prefix-sum
+            // cursors preserve within-group order), then ping-pong.
+            std::array<size_t, 4> off{start_[l][0], start_[l][1], start_[l][2],
+                                      start_[l][3]};
             for (size_t i = 0; i < n_; ++i) {
-                bucket[digits[i]].push_back(cur[i]);
+                next[off[digits[i]]++] = cur[i];
             }
-            size_t o = 0;
-            for (auto& b : bucket) {
-                for (uint32_t x : b) {
-                    cur[o++] = x;
-                }
-            }
+            cur.swap(next);
         }
     }
 

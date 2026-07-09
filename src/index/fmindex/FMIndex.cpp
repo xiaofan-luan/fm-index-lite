@@ -7,6 +7,19 @@
 #include <stdexcept>
 #include "index/fmindex/SuffixArray.h"
 
+#ifdef FMIX_BUILD_MEM_PROFILE
+#include <sys/resource.h>
+#define FMIX_MEM(tag)                                                        \
+    do {                                                                     \
+        struct rusage ru;                                                    \
+        getrusage(RUSAGE_SELF, &ru);                                         \
+        std::fprintf(stderr, "  [mem] %-20s peak=%ld MB\n", tag,             \
+                     ru.ru_maxrss / (1024 * 1024));                          \
+    } while (0)
+#else
+#define FMIX_MEM(tag) ((void)0)
+#endif
+
 namespace milvus::index::fmindex {
 
 void
@@ -84,6 +97,7 @@ FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate,
             sa32 = build_suffix_array_bytes(sa_input, len);
         }
     }  // folded buffer freed here
+    FMIX_MEM("after SA");
     auto sa_at = [&](size_t i) -> uint64_t {
         return use64 ? static_cast<uint64_t>(sa64[i])
                      : static_cast<uint64_t>(sa32[i]);
@@ -99,8 +113,9 @@ FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate,
         bwt[i] = (v == 0) ? 0u
                           : static_cast<uint32_t>(byte_to_id_[data[v - 1]]);
     }
+    FMIX_MEM("after BWT");
 
-    // 5. C-table over sigma_ (cumulative counts can reach m, so 64-bit)
+    // 4. C-table over sigma_ (cumulative counts can reach m, so 64-bit)
     c_.assign(sigma_, 0);
     for (uint32_t sym : bwt) {
         c_[sym]++;
@@ -112,15 +127,8 @@ FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate,
         acc += cnt;
     }
 
-    // 6. quad wavelet matrix over the BWT + per-symbol map_zero baseline
-    wm_ = WaveletMatrix4(bwt, qlevels_);
-    std::vector<uint32_t>().swap(bwt);  // BWT consumed; free before sampling
-    first_.resize(sigma_);
-    for (uint32_t c = 0; c < sigma_; ++c) {
-        first_[c] = wm_.map_zero(c);
-    }
-
-    // 7. sampled SA: mark rows whose SA value is a multiple of the rate.
+    // 5. sampled SA (needs the SA, not the BWT): do it before the wavelet so the
+    //    SA can be freed and does not stack onto the wavelet's peak memory.
     BitVector samp(m);
     sa_sample_vals_.clear();
     sa_sample_vals_.reserve(m / sa_sample_rate_ + 1);
@@ -133,8 +141,18 @@ FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate,
     }
     samp.build_rank();
     sampled_bv_ = std::move(samp);
-    std::vector<int32_t>().swap(sa32);  // SA no longer needed
+    std::vector<int32_t>().swap(sa32);  // SA no longer needed — free before wavelet
     std::vector<int64_t>().swap(sa64);
+    FMIX_MEM("after sampling");
+
+    // 6. quad wavelet matrix over the BWT (moved in — the BWT buffer becomes the
+    //    wavelet's working array, no copy) + per-symbol map_zero baseline.
+    wm_ = WaveletMatrix4(std::move(bwt), qlevels_);
+    FMIX_MEM("after wavelet");
+    first_.resize(sigma_);
+    for (uint32_t c = 0; c < sigma_; ++c) {
+        first_[c] = wm_.map_zero(c);
+    }
 
     buildDerived();
 }
