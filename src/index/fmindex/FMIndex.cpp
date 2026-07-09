@@ -107,11 +107,13 @@ FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate,
     //    array). bwt[i] is the symbol preceding row i's suffix; row 0's suffix
     //    starts at position 0 so its predecessor wraps to the sentinel (0). The
     //    aliased byte_to_id_ maps both letter cases to one id in folded mode.
-    std::vector<uint32_t> bwt(m);
+    // BWT symbols are dense ids in [0, sigma) with sigma <= 257, so uint16 holds
+    // them and halves this buffer (and the wavelet partition buffers it feeds).
+    std::vector<uint16_t> bwt(m);
     for (size_t i = 0; i < m; ++i) {
         uint64_t v = sa_at(i);
-        bwt[i] = (v == 0) ? 0u
-                          : static_cast<uint32_t>(byte_to_id_[data[v - 1]]);
+        bwt[i] = (v == 0) ? uint16_t{0}
+                          : static_cast<uint16_t>(byte_to_id_[data[v - 1]]);
     }
     FMIX_MEM("after BWT");
 

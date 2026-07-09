@@ -272,10 +272,12 @@ column's concatenated row values + `doc_start`; queries fan out and aggregate.
 - **Corpus `< 2^63` bytes** per index (32-bit SA under 2 GiB, `libsais64` above;
   positions stored 4 or 8 bytes by size). In practice **build memory** (~12× the
   corpus on the 32-bit path) is the real ceiling long before 2^63, so the
-  per-segment shard model stays the way to scale. Peak now sits at the wavelet
-  build (two n-element uint32 partition buffers); a `#define FMIX_BUILD_MEM_PROFILE`
-  logs per-phase peak RSS. Further cuts (uint16 partition buffers, in-place radix)
-  are open items.
+  per-segment shard model stays the way to scale. Peak sits at the wavelet build
+  (two n-element uint16 partition buffers — ids fit in 16 bits); a `#define
+  FMIX_BUILD_MEM_PROFILE` logs per-phase peak RSS. Note macOS's allocator retains
+  freed large pages, so its RSS shows the freed suffix array through the wavelet
+  phase (~12×); glibc returns them, so Linux peaks lower. In-place radix is the
+  next open item.
 - **DNA size** is behind sdsl; closing it (sentinel removal → 2 quad levels, or a
   bwa-mem2-style 2-bit occ) costs effort for a non-target workload.
 - **Repetitive corpora**: an r-index (RLBWT) could be ~10× smaller on heavily

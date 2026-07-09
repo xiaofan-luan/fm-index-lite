@@ -401,9 +401,9 @@ TEST(WaveletMatrix4, AccessRankMap2Consistent) {
         }
         uint32_t qlevels = (bits + 1) / 2;
         size_t n = 500;
-        std::vector<uint32_t> seq(n);
+        std::vector<uint16_t> seq(n);
         for (auto& x : seq) {
-            x = rng() % sigma;
+            x = static_cast<uint16_t>(rng() % sigma);
         }
         WaveletMatrix4 wm(seq, qlevels);
         for (size_t i = 0; i < n; ++i) {
@@ -511,7 +511,7 @@ TEST(Structures, EmptyDoNotCrash) {
 
     WaveletMatrix wm(std::vector<uint32_t>{}, 3);
     CHECK_EQ(wm.rank(1, 0), 0u);
-    WaveletMatrix4 wm4(std::vector<uint32_t>{}, 2);
+    WaveletMatrix4 wm4(std::vector<uint16_t>{}, 2);
     CHECK_EQ(wm4.rank(1, 0), 0u);
     CHECK_EQ(wm4.map_zero(1), 0u);
 }
@@ -547,9 +547,9 @@ TEST(WaveletMatrix4, AlphabetBoundariesAndSymbolSum) {
         }
         uint32_t qlevels = (bits + 1) / 2;
         size_t n = 1025;
-        std::vector<uint32_t> seq(n);
+        std::vector<uint16_t> seq(n);
         for (auto& x : seq) {
-            x = rng() % sigma;
+            x = static_cast<uint16_t>(rng() % sigma);
         }
         WaveletMatrix4 wm(seq, qlevels);
         // symbol-sum invariant over a random range: sum_c rank(c,j)-rank(c,i)==j-i
@@ -582,8 +582,9 @@ TEST(WaveletMatrix, BinaryVsQuadAgree) {
     for (auto& x : seq) {
         x = rng() % sigma;
     }
+    std::vector<uint16_t> seq16(seq.begin(), seq.end());  // WM4 takes uint16
     WaveletMatrix bwm(seq, bits);
-    WaveletMatrix4 qwm(seq, qlevels);
+    WaveletMatrix4 qwm(seq16, qlevels);
     for (size_t i = 0; i < n; ++i) {
         CHECK_EQ(bwm.access(i), qwm.access(i));
     }

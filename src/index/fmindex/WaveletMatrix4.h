@@ -16,17 +16,19 @@ class WaveletMatrix4 {
  public:
     WaveletMatrix4() = default;
 
-    // seq holds symbols in [0, 4^qlevels). qlevels = ceil(log2(sigma)/2).
+    // seq holds symbols in [0, 4^qlevels). qlevels = ceil(log2(sigma)/2), so with
+    // sigma <= 257 the symbols fit in uint16 — the partition buffers are half the
+    // size of a uint32 sequence, which matters because they are the build peak.
     // Takes seq by value: pass with std::move to build without copying it (the
     // caller's buffer becomes the working array). Memory during construction is
-    // two n-element uint32 buffers (cur + next, ping-ponged across levels) plus
+    // two n-element uint16 buffers (cur + next, ping-ponged across levels) plus
     // one n-byte digit array — not the 4 growable buckets of a naive partition.
-    WaveletMatrix4(std::vector<uint32_t> seq, uint32_t qlevels)
+    WaveletMatrix4(std::vector<uint16_t> seq, uint32_t qlevels)
         : n_(seq.size()), qlevels_(qlevels) {
         qv_.reserve(qlevels_);
         start_.assign(qlevels_, {0, 0, 0, 0});
-        std::vector<uint32_t> cur = std::move(seq);
-        std::vector<uint32_t> next(n_);
+        std::vector<uint16_t> cur = std::move(seq);
+        std::vector<uint16_t> next(n_);
         std::vector<uint8_t> digits(n_);
         for (uint32_t l = 0; l < qlevels_; ++l) {
             uint32_t shift = 2 * (qlevels_ - 1 - l);
