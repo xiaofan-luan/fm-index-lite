@@ -155,6 +155,14 @@ whose `valid()` is false (check it), and `MappedFMIndex::Open` returns `nullptr`
 Not supported (by design): regex, arbitrary lexicographic range between two different
 strings (needs forward navigation), incremental update, Unicode-aware case folding.
 
+**Parallel build.** The index is immutable and each `Build` is independent, so the
+natural way to use many cores is to **build shards concurrently** — one thread per
+segment index (measured ~4.4× on 8 shards, no extra dependency; queries then union
+across shards). To speed up a *single* large index instead, configure with
+`-DFMINDEX_OPENMP=ON` to parallelize the suffix-array construction via libsais
+OpenMP (~2× on that phase, ~1.4× on the whole build). It is **off by default**, so
+the default build has no OpenMP dependency and is single-threaded.
+
 ## Build & test
 
 ```bash

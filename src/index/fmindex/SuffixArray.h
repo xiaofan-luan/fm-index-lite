@@ -69,8 +69,15 @@ build_suffix_array_bytes(const uint8_t* data, size_t n) {
     }
     const int32_t fs = 6 * 1024;  // recommended free space for performance
     std::vector<int32_t> sa(n + 1 + fs);
-    // Write byte-SA into sa[0..n); sa[n..n+fs] is libsais scratch.
+    // Write byte-SA into sa[0..n); sa[n..n+fs] is libsais scratch. With the
+    // FMINDEX_OPENMP CMake switch (defines LIBSAIS_OPENMP), the parallel entry
+    // point uses all OpenMP threads (bound by OMP_NUM_THREADS); otherwise it is
+    // single-threaded.
+#ifdef LIBSAIS_OPENMP
+    libsais_omp(data, sa.data(), static_cast<int32_t>(n), fs + 1, nullptr, 0);
+#else
     libsais(data, sa.data(), static_cast<int32_t>(n), fs + 1, nullptr);
+#endif
     std::memmove(sa.data() + 1, sa.data(), n * sizeof(int32_t));
     sa[0] = static_cast<int32_t>(n);  // sentinel suffix sorts first
     sa.resize(n + 1);
@@ -88,7 +95,11 @@ build_suffix_array_bytes64(const uint8_t* data, size_t n) {
     }
     const int64_t fs = 6 * 1024;
     std::vector<int64_t> sa(n + 1 + fs);
+#ifdef LIBSAIS_OPENMP
+    libsais64_omp(data, sa.data(), static_cast<int64_t>(n), fs + 1, nullptr, 0);
+#else
     libsais64(data, sa.data(), static_cast<int64_t>(n), fs + 1, nullptr);
+#endif
     std::memmove(sa.data() + 1, sa.data(), n * sizeof(int64_t));
     sa[0] = static_cast<int64_t>(n);  // sentinel suffix sorts first
     sa.resize(n + 1);
