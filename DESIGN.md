@@ -223,7 +223,7 @@ instance (guaranteed by the build-then-serve lifecycle). Verified: an 8-thread
 stress test agrees with single-threaded results and runs clean under
 ThreadSanitizer (`test/test_fmindex.cpp`).
 
-**mmap (zero-copy load).** The serialization format (v4) lays each large payload
+**mmap (zero-copy load).** The serialization format (v5) lays each large payload
 array — the quad wavelet words and the sampled-row bit words — at an 8-byte
 boundary, so they can be viewed in place from a memory mapping. `BitVector` and
 `QuadVector` store their words as a pointer + length that is either **owned**

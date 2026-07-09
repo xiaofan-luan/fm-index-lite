@@ -154,16 +154,22 @@ FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate,
         first_[c] = wm_.map_zero(c);
     }
 
-    buildDerived();
+    if (!buildDerived()) {
+        throw std::logic_error("FMIndex: invalid sampled suffix array");
+    }
 }
 
-void
+bool
 FMIndex::buildDerived() {
     // id -> byte (inverse of byte_to_id_). For a case-folded index both 'A' and
     // 'a' map to one id; ascending iteration lets lowercase win, so Extract
     // returns the canonical lowercase byte.
     id_to_byte_.assign(sigma_, 0);
     for (int b = 0; b < 256; ++b) {
+        if (byte_to_id_[b] < -1 ||
+            byte_to_id_[b] >= static_cast<int32_t>(sigma_)) {
+            return false;
+        }
         if (byte_to_id_[b] > 0) {
             id_to_byte_[byte_to_id_[b]] = static_cast<uint8_t>(b);
         }
@@ -172,14 +178,34 @@ FMIndex::buildDerived() {
     // Every multiple of rate in [0, text_len_] appears exactly once in the SA,
     // so this array is fully populated. Gives Extract an anchor within `rate`
     // steps of any position without needing select/psi.
+    if (sa_sample_rate_ == 0) {
+        return false;
+    }
+    if (sampled_bv_.count_ones() != sa_sample_vals_.size()) {
+        return false;
+    }
     const size_t m = text_len_ + 1;
-    isa_sample_.assign(text_len_ / sa_sample_rate_ + 1, 0);
+    const uint64_t kMissing = UINT64_MAX;
+    isa_sample_.assign(text_len_ / sa_sample_rate_ + 1, kMissing);
     for (size_t r = 0; r < m; ++r) {
         if (sampled_bv_.get(r)) {
             uint64_t val = sa_sample_vals_[sampled_bv_.rank1(r)];
-            isa_sample_[val / sa_sample_rate_] = static_cast<uint64_t>(r);
+            if (val > text_len_ || val % sa_sample_rate_ != 0) {
+                return false;
+            }
+            size_t slot = static_cast<size_t>(val / sa_sample_rate_);
+            if (slot >= isa_sample_.size() || isa_sample_[slot] != kMissing) {
+                return false;
+            }
+            isa_sample_[slot] = static_cast<uint64_t>(r);
         }
     }
+    for (uint64_t row : isa_sample_) {
+        if (row == kMissing) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::string
@@ -328,6 +354,9 @@ FMIndex::CountBatch(
 
 std::vector<uint64_t>
 FMIndex::Locate(const uint8_t* pattern, size_t plen) const {
+    if (plen == 0) {
+        return {};
+    }
     auto r = BackwardSearch(pattern, plen);
     std::vector<uint64_t> out;
     for (size_t i = r.first; i < r.second; ++i) {
@@ -562,17 +591,25 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         sigma_ = get<uint32_t>(p, end);
         qlevels_ = get<uint32_t>(p, end);
         uint32_t flags = get<uint32_t>(p, end);  // former pad, now flags
+        if (flags & ~3u) {
+            return false;
+        }
         case_fold_ = (flags & 1u) != 0;
         wide_storage_ = (flags & 2u) != 0;
-        if (sigma_ == 0 || sigma_ > 257 || qlevels_ > 5) {
+        if (sa_sample_rate_ == 0 || sigma_ == 0 || sigma_ > 257 ||
+            qlevels_ == 0 || qlevels_ > 5) {
             return false;
         }
         text_len_ = get<uint64_t>(p, end);
+        if (text_len_ >= (static_cast<uint64_t>(1) << 63)) {
+            return false;
+        }
+        const size_t m = static_cast<size_t>(text_len_) + 1;
         for (int i = 0; i < 256; ++i) {
             byte_to_id_[i] = get<int32_t>(p, end);
             // A byte maps to -1 (absent) or a dense id in [1, sigma_). Anything
             // else would index c_/first_ (size sigma_) out of bounds in a query.
-            if (byte_to_id_[i] < -1 ||
+            if (byte_to_id_[i] < -1 || byte_to_id_[i] == 0 ||
                 byte_to_id_[i] >= static_cast<int32_t>(sigma_)) {
                 return false;
             }
@@ -580,11 +617,23 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         c_.resize(sigma_);
         for (uint32_t i = 0; i < sigma_; ++i) {
             c_[i] = get<uint64_t>(p, end);
+            if (c_[i] > m || (i > 0 && c_[i] < c_[i - 1])) {
+                return false;
+            }
+        }
+        if (c_[0] != 0) {
+            return false;
         }
         std::vector<std::array<size_t, 4>> starts(qlevels_);
         for (uint32_t l = 0; l < qlevels_; ++l) {
             for (int d = 0; d < 4; ++d) {
                 starts[l][d] = static_cast<size_t>(get<uint64_t>(p, end));
+                if (starts[l][d] > m || (d > 0 && starts[l][d] < starts[l][d - 1])) {
+                    return false;
+                }
+            }
+            if (starts[l][0] != 0) {
+                return false;
             }
         }
         std::vector<uint64_t> qnw(qlevels_);
@@ -595,7 +644,6 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         uint64_t n_samples = get<uint64_t>(p, end);
         uint64_t n_docs = get<uint64_t>(p, end);
 
-        const size_t m = text_len_ + 1;
         // The payload section sizes are fully determined by m; reject any blob
         // whose declared counts don't match (a mutated size would otherwise
         // drive align_view / from_view to read past the mapping).
@@ -653,7 +701,18 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         const uint64_t* dsp = align_view(n_docs * sizeof(uint64_t));
         doc_start_.resize(n_docs);
         std::memcpy(doc_start_.data(), dsp, n_docs * sizeof(uint64_t));
-        buildDerived();  // id_to_byte_, isa_sample_ (in-RAM only)
+        if (doc_start_.empty() || doc_start_[0] != 0) {
+            return false;
+        }
+        for (size_t i = 0; i < doc_start_.size(); ++i) {
+            if (doc_start_[i] > text_len_ ||
+                (i > 0 && doc_start_[i] < doc_start_[i - 1])) {
+                return false;
+            }
+        }
+        if (!buildDerived()) {  // id_to_byte_, isa_sample_ (in-RAM only)
+            return false;
+        }
         return true;
     } catch (const std::exception&) {
         return false;

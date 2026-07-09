@@ -74,7 +74,8 @@ for (const std::string& d : docs) { doc_start.push_back(concat.size()); concat +
 // 2. build
 //    Build(data, len, sa_sample_rate = 32)
 //      data           first byte of the concatenated buffer
-//      len            its length in BYTES (< 2^31; shard larger corpora)
+//      len            its length in BYTES (< 2^63; 32-bit SA below 2 GiB,
+//                     64-bit SA above; shard large corpora for build memory)
 //      sa_sample_rate SA sampling rate: space/locate trade-off, no effect on
 //                     Count — default 32 is balanced; 4-8 = faster Locate,
 //                     bigger index; 64+ = smaller index if you only Count
@@ -129,6 +130,11 @@ calling `Count` in a loop. It is the right primitive for decontamination
 | `Serialize()` / `SerializeToFile(path)` | persist the index |
 | `Deserialize(blob)` / `LoadView(base, size)` | load (copy / zero-copy mmap) |
 
+**Empty patterns.** `Count("", 0)` returns the number of insertion positions
+(`text_len + 1`). Locate-style APIs do not attribute empty matches:
+`Locate`, `LocateDocs`, `LocatePrefixDocs`, and `LocateSuffixDocs` return empty
+for `len == 0`.
+
 **Anchored matching.** `Count`/`Locate` find `pat` *anywhere* (substring). To match
 only at document boundaries — "log lines starting with `ERROR`", "files ending in
 `.log`" — use `LocatePrefixDocs` / `LocateSuffixDocs`; they return the sorted, unique
@@ -160,7 +166,7 @@ strings (needs forward navigation), incremental update, Unicode-aware case foldi
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
-./build/test_fmindex     # 48 tests / 391k checks (concurrency, Extract, 32/64-bit)
+./build/test_fmindex     # 51 tests / 391k checks (concurrency, Extract, 32/64-bit)
 ./build/demo             # tiny walkthrough of the anchored + case-insensitive API
 ./build/bench_fmindex    # build / count / batch / locate / size
 ./build/bench_mmap       # in-RAM vs mmap query throughput

@@ -73,6 +73,79 @@ brute_positions(const std::string& text, const std::string& pat) {
     return out;
 }
 
+static uint32_t
+read_u32(const std::string& s, size_t off) {
+    uint32_t v;
+    std::memcpy(&v, s.data() + off, sizeof(v));
+    return v;
+}
+
+static uint64_t
+read_u64(const std::string& s, size_t off) {
+    uint64_t v;
+    std::memcpy(&v, s.data() + off, sizeof(v));
+    return v;
+}
+
+static void
+write_u32(std::string& s, size_t off, uint32_t v) {
+    std::memcpy(&s[off], &v, sizeof(v));
+}
+
+static void
+write_u64(std::string& s, size_t off, uint64_t v) {
+    std::memcpy(&s[off], &v, sizeof(v));
+}
+
+static size_t
+align8(size_t off) {
+    return (off + 7u) & ~size_t(7u);
+}
+
+struct SerializedPayloadOffsets {
+    size_t sampled_sa = 0;
+    size_t doc_start = 0;
+    size_t sample_width = 0;
+};
+
+static SerializedPayloadOffsets
+payload_offsets(const std::string& blob) {
+    SerializedPayloadOffsets out;
+    uint32_t sigma = read_u32(blob, 12);
+    uint32_t qlevels = read_u32(blob, 16);
+    uint32_t flags = read_u32(blob, 20);
+    out.sample_width = (flags & 2u) ? 8 : 4;
+
+    size_t off = 6 * sizeof(uint32_t) + sizeof(uint64_t);  // through text_len
+    off += 256 * sizeof(int32_t);                          // byte_to_id
+    off += size_t(sigma) * sizeof(uint64_t);                // C-table
+    off += size_t(qlevels) * 4 * sizeof(uint64_t);          // starts
+
+    std::vector<uint64_t> qwords(qlevels);
+    for (uint32_t l = 0; l < qlevels; ++l) {
+        qwords[l] = read_u64(blob, off);
+        off += sizeof(uint64_t);
+    }
+    uint64_t sampled_words = read_u64(blob, off);
+    off += sizeof(uint64_t);
+    uint64_t samples = read_u64(blob, off);
+    off += sizeof(uint64_t);
+    off += sizeof(uint64_t);  // doc count
+
+    for (uint32_t l = 0; l < qlevels; ++l) {
+        off = align8(off);
+        off += static_cast<size_t>(qwords[l]) * sizeof(uint64_t);
+    }
+    off = align8(off);
+    off += static_cast<size_t>(sampled_words) * sizeof(uint64_t);
+    off = align8(off);
+    out.sampled_sa = off;
+    off += static_cast<size_t>(samples) * out.sample_width;
+    off = align8(off);
+    out.doc_start = off;
+    return out;
+}
+
 // ---------- BitVector ----------
 TEST(BitVector, RankMatchesBruteForce) {
     std::vector<bool> ref = {1, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 1};
@@ -996,6 +1069,44 @@ TEST(FMIndex, DeserializeRejectsCorruptByteMap) {
     CHECK_EQ(bad.Count(bytes("banana"), 6), size_t(0));
 }
 
+TEST(FMIndex, DeserializeRejectsCorruptSampleValues) {
+    std::string text = "abc";
+    FMIndex fm;
+    fm.Build(bytes(text), text.size(), 1);
+    std::string blob = fm.Serialize();
+
+    SerializedPayloadOffsets off = payload_offsets(blob);
+    CHECK(off.sampled_sa + off.sample_width <= blob.size());
+    // First sampled SA value now points far beyond text_len_; a loader must reject
+    // this before buildDerived indexes isa_sample_[value / sample_rate].
+    if (off.sample_width == 8) {
+        write_u64(blob, off.sampled_sa, 1000000);
+    } else {
+        write_u32(blob, off.sampled_sa, 1000000);
+    }
+
+    FMIndex bad = FMIndex::Deserialize(blob);
+    CHECK(!bad.valid());
+    CHECK_EQ(bad.Count(bytes("a"), 1), size_t(0));
+}
+
+TEST(FMIndex, DeserializeRejectsInvalidDocStarts) {
+    std::string text = "abc";
+    FMIndex fm;
+    fm.Build(bytes(text), text.size(), 1);
+    std::string blob = fm.Serialize();
+
+    SerializedPayloadOffsets off = payload_offsets(blob);
+    CHECK(off.doc_start + sizeof(uint64_t) <= blob.size());
+    // doc_start must begin at 0. If accepted, LocateDocs underflows the
+    // upper_bound result for matches before doc_start[0].
+    write_u64(blob, off.doc_start, 2);
+
+    FMIndex bad = FMIndex::Deserialize(blob);
+    CHECK(!bad.valid());
+    CHECK_EQ(bad.Count(bytes("a"), 1), size_t(0));
+}
+
 TEST(FMIndex, MappedOpenFailsOnCorruptFile) {
     std::string text = "the quick brown fox";
     FMIndex fm;
@@ -1021,6 +1132,27 @@ TEST(FMIndex, MappedOpenFailsOnCorruptFile) {
     auto bad = MappedFMIndex::Open(path);
     CHECK(bad == nullptr);
     std::remove(path.c_str());
+}
+
+TEST(FMIndex, EmptyPatternsAreNotLocated) {
+    std::vector<std::string> docs = {"ab", "cd", ""};
+    std::string concat;
+    std::vector<uint64_t> starts;
+    for (auto& d : docs) {
+        starts.push_back(concat.size());
+        concat += d;
+    }
+    FMIndex fm;
+    fm.Build(bytes(concat), concat.size(), 1);
+    fm.SetDocStarts(starts);
+
+    CHECK_EQ(fm.Count(bytes(""), 0), concat.size() + 1);
+    CHECK(fm.Locate(bytes(""), 0).empty());
+    CHECK(fm.LocateDocs(bytes(""), 0).empty());
+    CHECK(fm.LocatePrefixDocs(bytes(""), 0).empty());
+    CHECK(fm.LocateSuffixDocs(bytes(""), 0).empty());
+    CHECK_EQ(fm.CountPrefixDocs(bytes(""), 0), size_t(0));
+    CHECK_EQ(fm.CountSuffixDocs(bytes(""), 0), size_t(0));
 }
 
 TEST(SuffixArray, Bytes32And64Agree) {

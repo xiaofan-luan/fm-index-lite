@@ -26,8 +26,9 @@ class FMIndex {
     //   data            pointer to the first byte of the buffer.
     //   len             its length in BYTES (not documents, not characters;
     //                   a UTF-8 CJK char counts as its 3 bytes). Must be
-    //                   < 2^31; for larger corpora, shard and build one index
-    //                   per shard. Count/Locate are exact over [data, data+len).
+    //                   < 2^63; the build uses a 32-bit suffix array below 2 GiB
+    //                   and a 64-bit suffix array above. Count/Locate are exact
+    //                   over [data, data+len).
     //   sa_sample_rate  suffix-array sampling rate R (>= 1): store one SA value
     //                   every R text positions, recovering the rest via LF-
     //                   mapping. Pure space/locate trade-off, zero effect on
@@ -68,6 +69,8 @@ class FMIndex {
     CountBatch(const std::vector<std::pair<const uint8_t*, size_t>>& patterns)
         const;
 
+    // Empty patterns are countable (`Count("") == text_len + 1`) but are not
+    // located; Locate/LocateDocs/anchored doc APIs return empty for plen == 0.
     std::vector<uint64_t>
     Locate(const uint8_t* pattern, size_t plen) const;
 
@@ -176,7 +179,7 @@ class FMIndex {
     // Rebuild the in-RAM-only structures derived from the serialized fields:
     // id_to_byte_ (from byte_to_id_) and isa_sample_ (from sampled_bv_ +
     // sa_sample_vals_). Called after Build and after a load.
-    void
+    bool
     buildDerived();
     // Fill *this by viewing serialized bytes at base; the wavelet/sampled word
     // arrays are viewed, the small sample/doc arrays are copied. Returns false
