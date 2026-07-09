@@ -52,6 +52,12 @@ class MappedFMIndex {
         self->size_ = sz;
         self->index_ = FMIndex::LoadView(
             reinterpret_cast<const uint8_t*>(addr), sz);
+        // A truncated / corrupt / wrong-version file yields an empty index that
+        // silently answers 0 to every query. Surface that as an open failure
+        // (the destructor unmaps) instead of handing back a dud.
+        if (!self->index_.valid()) {
+            return nullptr;
+        }
         return self;
     }
 

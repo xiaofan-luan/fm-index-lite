@@ -131,6 +131,13 @@ class FMIndex {
     case_insensitive() const {
         return case_fold_;
     }
+    // False for a default-constructed index or one whose Deserialize/LoadView
+    // failed (a failed load yields an empty index that answers 0 to everything);
+    // callers loading from disk should check this.
+    bool
+    valid() const {
+        return !c_.empty();
+    }
 
     // --- serialization ---
     // Serialize to a flat, 8-byte-aligned blob (payload arrays aligned so they

@@ -303,6 +303,15 @@ FMIndex::LocateDocs(const uint8_t* pattern, size_t plen) const {
     for (uint64_t pos : positions) {
         auto it = std::upper_bound(doc_start_.begin(), doc_start_.end(), pos);
         uint64_t doc_id = static_cast<uint64_t>(it - doc_start_.begin()) - 1;
+        uint64_t doc_end = (doc_id + 1 < doc_start_.size())
+                               ? doc_start_[doc_id + 1]
+                               : text_len_;
+        // Skip matches that spill past this document's end into the next one:
+        // documents are concatenated, so such an occurrence exists only in the
+        // raw buffer, not in any single document.
+        if (pos + plen > doc_end) {
+            continue;
+        }
         out.emplace_back(doc_id, pos - doc_start_[doc_id]);
     }
     std::sort(out.begin(), out.end());
@@ -315,10 +324,17 @@ FMIndex::LocatePrefixDocs(const uint8_t* pattern, size_t plen) const {
     std::vector<uint64_t> docs;
     for (uint64_t pos : positions) {
         // A document begins with the pattern iff the occurrence sits exactly on
-        // that document's start boundary.
+        // that document's start boundary AND fits within the document (a match
+        // that spills into the next document doesn't count as a prefix).
         auto it = std::lower_bound(doc_start_.begin(), doc_start_.end(), pos);
         if (it != doc_start_.end() && *it == pos) {
-            docs.push_back(static_cast<uint64_t>(it - doc_start_.begin()));
+            uint64_t doc_id = static_cast<uint64_t>(it - doc_start_.begin());
+            uint64_t doc_end = (doc_id + 1 < doc_start_.size())
+                                   ? doc_start_[doc_id + 1]
+                                   : text_len_;
+            if (pos + plen <= doc_end) {
+                docs.push_back(doc_id);
+            }
         }
     }
     std::sort(docs.begin(), docs.end());
@@ -486,6 +502,12 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         text_len_ = get<uint64_t>(p, end);
         for (int i = 0; i < 256; ++i) {
             byte_to_id_[i] = get<int32_t>(p, end);
+            // A byte maps to -1 (absent) or a dense id in [1, sigma_). Anything
+            // else would index c_/first_ (size sigma_) out of bounds in a query.
+            if (byte_to_id_[i] < -1 ||
+                byte_to_id_[i] >= static_cast<int32_t>(sigma_)) {
+                return false;
+            }
         }
         c_.resize(sigma_);
         for (uint32_t i = 0; i < sigma_; ++i) {
@@ -506,6 +528,20 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         uint64_t n_docs = get<uint64_t>(p, end);
 
         const size_t m = text_len_ + 1;
+        // The payload section sizes are fully determined by m; reject any blob
+        // whose declared counts don't match (a mutated size would otherwise
+        // drive align_view / from_view to read past the mapping).
+        const uint64_t exp_qnw = (m + 31) / 32;   // 2-bit symbols, 32 per word
+        const uint64_t exp_snw = (m + 63) / 64;   // 1-bit rows, 64 per word
+        for (uint32_t l = 0; l < qlevels_; ++l) {
+            if (qnw[l] != exp_qnw) {
+                return false;
+            }
+        }
+        if (sampled_nw != exp_snw || n_samples > m || n_docs == 0 ||
+            n_docs > m + 1) {
+            return false;
+        }
         auto align_view = [&](uint64_t nbytes) -> const uint64_t* {
             size_t off = static_cast<size_t>(p - reinterpret_cast<const char*>(
                                                      base));

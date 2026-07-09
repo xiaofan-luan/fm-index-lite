@@ -47,6 +47,14 @@ doc_start   = [ 0,           13,           26 ]   // byte offset where each doc 
 - One index handles corpora up to **~2 GB**; for larger data, build one index per
   shard/segment and union the results (this is how it plugs into Milvus, one index
   per sealed segment).
+- **Document boundaries are respected on attribution.** Because documents are
+  concatenated, a pattern can straddle a seam (e.g. docs `"ab"`,`"cd"` — `"bc"`
+  exists in the buffer but in no document). Raw `Count`/`Locate` work over the
+  concatenated buffer and *do* see such matches; the document-attributed queries
+  (`LocateDocs`, `LocatePrefixDocs`, `LocateSuffixDocs`) **exclude** them, so they
+  never report a match that no single document contains. If you need `Count`
+  itself to be per-document exact, separate documents with a byte your queries
+  never use.
 
 ## Quick start
 
@@ -136,7 +144,9 @@ letters come back lowercased (original case isn't stored).
 index at once (verified: an 8-thread stress test matches single-threaded results and
 is ThreadSanitizer-clean). **Immutable:** build-once; to update, rebuild (or, at
 scale, add a new shard and mask deletes at query time). **Serving:** `LoadView` maps
-the index zero-copy from an mmap'd file — warm query throughput equals in-RAM.
+the index zero-copy from an mmap'd file — warm query throughput equals in-RAM. A
+truncated or corrupt blob is rejected: `Deserialize`/`LoadView` yield an index
+whose `valid()` is false (check it), and `MappedFMIndex::Open` returns `nullptr`.
 
 Not supported (by design): regex, arbitrary lexicographic range between two different
 strings (needs forward navigation), incremental update, Unicode-aware case folding.
@@ -146,7 +156,7 @@ strings (needs forward navigation), incremental update, Unicode-aware case foldi
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
-./build/test_fmindex     # 42 tests / 383k checks (incl. concurrency + Extract fuzz)
+./build/test_fmindex     # 45 tests / 383k checks (concurrency, Extract, corrupt-blob)
 ./build/demo             # tiny walkthrough of the anchored + case-insensitive API
 ./build/bench_fmindex    # build / count / batch / locate / size
 ./build/bench_mmap       # in-RAM vs mmap query throughput

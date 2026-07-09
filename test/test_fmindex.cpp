@@ -947,6 +947,82 @@ TEST(FMIndex, ConcurrentQueriesMatchSingleThreaded) {
     CHECK_EQ(mismatches.load(), 0);
 }
 
+TEST(FMIndex, NoCrossDocumentFalsePositives) {
+    // Documents are concatenated with only doc_start boundaries; a pattern that
+    // straddles a document seam occurs in the raw buffer but in NO document.
+    std::vector<std::string> docs = {"ab", "cd", "ef"};
+    std::string concat;
+    std::vector<uint64_t> starts;
+    for (auto& d : docs) { starts.push_back(concat.size()); concat += d; }
+    FMIndex fm;
+    fm.Build(bytes(concat), concat.size(), 1);
+    fm.SetDocStarts(starts);
+
+    // "bc" spans the ab|cd seam: raw Count sees it, but it belongs to no doc.
+    CHECK_EQ(fm.Count(bytes("bc"), 2), size_t(1));          // raw concat
+    CHECK(fm.LocateDocs(bytes("bc"), 2).empty());           // no document
+    CHECK(fm.LocatePrefixDocs(bytes("bc"), 2).empty());
+
+    // "dcd"? no. A genuine within-doc match still works.
+    auto hits = fm.LocateDocs(bytes("cd"), 2);
+    std::vector<std::pair<uint64_t, uint64_t>> expect = {{1, 0}};
+    CHECK_EQ(hits, expect);
+    // "abc" starts at doc 0 but spills into doc 1 -> not a prefix of doc 0.
+    CHECK_EQ(fm.Count(bytes("abc"), 3), size_t(1));
+    CHECK(fm.LocatePrefixDocs(bytes("abc"), 3).empty());
+    // but "ab" is a real prefix (and full) of doc 0.
+    std::vector<uint64_t> pfx = {0};
+    CHECK_EQ(fm.LocatePrefixDocs(bytes("ab"), 2), pfx);
+}
+
+TEST(FMIndex, DeserializeRejectsCorruptByteMap) {
+    std::string text = "banana";
+    FMIndex fm;
+    fm.Build(bytes(text), text.size(), 4);
+    std::string blob = fm.Serialize();
+
+    // Header layout: magic,ver,rate,sigma,qlevels,casefold (6*uint32=24) then
+    // text_len (uint64) => byte_to_id_ starts at offset 32, entry b at 32+4b.
+    // Point byte 'z' (normally -1, absent) at a bogus id well past sigma_.
+    int32_t bogus = 100;
+    size_t off = 32 + size_t('z') * 4;
+    CHECK(off + 4 <= blob.size());
+    std::memcpy(&blob[off], &bogus, sizeof(bogus));
+
+    FMIndex bad = FMIndex::Deserialize(blob);
+    CHECK(!bad.valid());  // rejected, not a live index
+    // Querying the (empty) index must not read out of bounds — just returns 0.
+    CHECK_EQ(bad.Count(bytes("z"), 1), size_t(0));
+    CHECK_EQ(bad.Count(bytes("banana"), 6), size_t(0));
+}
+
+TEST(FMIndex, MappedOpenFailsOnCorruptFile) {
+    std::string text = "the quick brown fox";
+    FMIndex fm;
+    fm.Build(bytes(text), text.size(), 4);
+    std::string path = "/tmp/fmix_corrupt_test.fmix";
+    CHECK(SaveToFile(fm, path));
+
+    // Sanity: a good file opens.
+    auto ok = MappedFMIndex::Open(path);
+    CHECK(ok != nullptr);
+    ok.reset();
+
+    // Corrupt the magic; Open must now fail (nullptr), not hand back a dud.
+    {
+        FILE* f = std::fopen(path.c_str(), "r+b");
+        CHECK(f != nullptr);
+        if (f) {
+            const char junk[4] = {'X', 'X', 'X', 'X'};
+            std::fwrite(junk, 1, 4, f);
+            std::fclose(f);
+        }
+    }
+    auto bad = MappedFMIndex::Open(path);
+    CHECK(bad == nullptr);
+    std::remove(path.c_str());
+}
+
 int
 main() {
     setvbuf(stdout, nullptr, _IONBF, 0);  // unbuffered: survive a crash
