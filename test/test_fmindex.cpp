@@ -1094,6 +1094,78 @@ TEST(FMIndex, WideStorageSurvivesRoundTrip) {
     CHECK(fm2.Serialize() == blob);
 }
 
+TEST(FMIndex, MegabyteScaleVsNaiveOracle) {
+    // Correctness at a scale the tiny fuzz tests don't reach (~1 MB), against an
+    // independent naive std::string::find oracle, exercising BOTH the 32-bit and
+    // 64-bit (force_wide) build paths on the same data.
+    std::mt19937 rng(4242);
+    const size_t N = 1u << 20;  // 1 MiB
+    std::string text(N, 'a');
+    for (auto& c : text) c = char('a' + rng() % 6);  // small alphabet: real hits
+    // inject a few known needles so long patterns match too
+    const char* needles[] = {"zebra", "qwerty", "needle123", "FoxJumps"};
+    for (const char* nd : needles)
+        for (int k = 0; k < 20; ++k)
+            text.replace(rng() % (N - 16), strlen(nd), nd);
+
+    FMIndex narrow, wide;
+    narrow.Build(bytes(text), text.size(), 16);
+    wide.Build(bytes(text), text.size(), 16, false, /*force_wide=*/true);
+
+    auto naive_count = [&](const std::string& p) {
+        size_t c = 0, pos = 0;
+        while ((pos = text.find(p, pos)) != std::string::npos) { ++c; ++pos; }
+        return c;
+    };
+    auto naive_pos = [&](const std::string& p) {
+        std::vector<uint64_t> v;
+        size_t pos = 0;
+        while ((pos = text.find(p, pos)) != std::string::npos) {
+            v.push_back(pos);
+            ++pos;
+        }
+        return v;
+    };
+
+    // build a mix of patterns: known needles, likely-present short strings,
+    // likely-absent strings
+    std::vector<std::string> pats;
+    for (const char* nd : needles) pats.push_back(nd);
+    for (int i = 0; i < 80; ++i) {
+        size_t pl = 3 + rng() % 8;
+        std::string p;
+        for (size_t j = 0; j < pl; ++j) p += char('a' + rng() % 6);
+        pats.push_back(p);
+    }
+    for (int i = 0; i < 20; ++i)  // absent (uses 'x','y','z' rarely in text)
+        pats.push_back(std::string(4 + rng() % 4, 'x'));
+
+    std::vector<std::pair<const uint8_t*, size_t>> batch;
+    for (auto& p : pats) batch.emplace_back(bytes(p), p.size());
+    auto counts32 = narrow.CountBatch(batch);
+
+    for (size_t i = 0; i < pats.size(); ++i) {
+        const std::string& p = pats[i];
+        size_t want = naive_count(p);
+        CHECK_EQ(narrow.Count(bytes(p), p.size()), want);
+        CHECK_EQ(wide.Count(bytes(p), p.size()), want);   // 64-bit path agrees
+        CHECK_EQ(counts32[i], want);                      // batched agrees
+        auto want_pos = naive_pos(p);
+        std::sort(want_pos.begin(), want_pos.end());
+        auto got = narrow.Locate(bytes(p), p.size());     // Locate already sorted
+        CHECK_EQ(got, want_pos);
+        CHECK_EQ(wide.Locate(bytes(p), p.size()), want_pos);
+    }
+    // Extract random windows against the source text (both paths).
+    for (int q = 0; q < 200; ++q) {
+        uint64_t pos = rng() % N;
+        size_t len = rng() % 64;
+        std::string want = text.substr(pos, std::min<size_t>(len, N - pos));
+        CHECK_EQ(narrow.Extract(pos, len), want);
+        CHECK_EQ(wide.Extract(pos, len), want);
+    }
+}
+
 int
 main() {
     setvbuf(stdout, nullptr, _IONBF, 0);  // unbuffered: survive a crash
