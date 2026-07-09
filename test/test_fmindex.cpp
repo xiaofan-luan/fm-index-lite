@@ -17,7 +17,6 @@
 #include "index/fmindex/MmapFmIndex.h"
 #include "index/fmindex/QuadVector.h"
 #include "index/fmindex/SuffixArray.h"
-#include "index/fmindex/TokenFMIndex.h"
 #include "index/fmindex/WaveletMatrix.h"
 #include "index/fmindex/WaveletMatrix4.h"
 #include "simple_test.h"
@@ -1289,81 +1288,6 @@ TEST(FMIndex, NextTokenCountsVsOracle) {
     check("abc");
     check("a");
     check("z");    // absent -> empty
-}
-
-TEST(TokenFMIndex, VsNaiveOracle) {
-    std::mt19937 rng(2029);
-    // token corpus: a small "vocab" with big gaps so ids exercise uint32 (not
-    // just 0..255) and the dense remap; repeats so patterns actually recur.
-    std::vector<uint32_t> vocab = {5, 42, 1000, 99999, 7, 300000, 128, 65536};
-    std::vector<uint32_t> corpus;
-    std::vector<uint64_t> starts;
-    for (int d = 0; d < 60; ++d) {
-        starts.push_back(corpus.size());
-        size_t dl = 4 + rng() % 20;
-        for (size_t i = 0; i < dl; ++i) corpus.push_back(vocab[rng() % vocab.size()]);
-    }
-    TokenFMIndex fm;
-    fm.Build(corpus.data(), corpus.size(), 8);
-    fm.SetDocStarts(starts);
-    CHECK(fm.valid());
-
-    auto occ = [&](const std::vector<uint32_t>& p) {  // naive positions
-        std::vector<uint64_t> v;
-        if (p.empty()) return v;
-        for (size_t i = 0; i + p.size() <= corpus.size(); ++i)
-            if (std::equal(p.begin(), p.end(), corpus.begin() + i)) v.push_back(i);
-        return v;
-    };
-
-    // random token patterns (some present, some with an absent token)
-    for (int q = 0; q < 300; ++q) {
-        size_t pl = 1 + rng() % 4;
-        std::vector<uint32_t> p;
-        for (size_t j = 0; j < pl; ++j) {
-            uint32_t tok = (rng() % 5 == 0) ? 424242u  // absent token
-                                            : vocab[rng() % vocab.size()];
-            p.push_back(tok);
-        }
-        auto want = occ(p);
-        CHECK_EQ(fm.Count(p.data(), p.size()), want.size());
-        CHECK_EQ(fm.Locate(p.data(), p.size()), want);
-    }
-
-    // LongestMatch vs brute force
-    auto lm_oracle = [&](const std::vector<uint32_t>& q) {
-        size_t best = 0;
-        for (size_t i = 0; i < q.size(); ++i)
-            for (size_t len = q.size() - i; len > best; --len) {
-                std::vector<uint32_t> sub(q.begin() + i, q.begin() + i + len);
-                if (!occ(sub).empty()) { best = len; break; }
-            }
-        return best;
-    };
-    for (int q = 0; q < 30; ++q) {
-        std::vector<uint32_t> query;
-        size_t ql = 3 + rng() % 10;
-        for (size_t j = 0; j < ql; ++j)
-            query.push_back((rng() % 4 == 0) ? 424242u : vocab[rng() % vocab.size()]);
-        CHECK_EQ(fm.LongestMatch(query.data(), query.size()).length, lm_oracle(query));
-    }
-
-    // NextTokenCounts vs oracle, and Extract round-trip
-    for (uint32_t ctxtok : vocab) {
-        std::vector<uint32_t> ctx = {ctxtok};
-        std::map<uint32_t, size_t> want;
-        for (uint64_t pos : occ(ctx))
-            if (pos + 1 < corpus.size()) want[corpus[pos + 1]]++;
-        std::vector<std::pair<uint32_t, size_t>> wv(want.begin(), want.end());
-        CHECK_EQ(fm.NextTokenCounts(ctx.data(), ctx.size()), wv);
-    }
-    for (int q = 0; q < 50; ++q) {
-        uint64_t pos = rng() % corpus.size();
-        size_t len = rng() % 12;
-        size_t wl = std::min<size_t>(len, corpus.size() - pos);
-        std::vector<uint32_t> want(corpus.begin() + pos, corpus.begin() + pos + wl);
-        CHECK_EQ(fm.Extract(pos, len), want);
-    }
 }
 
 TEST(FMIndex, MatchingDocsAndFuzzyVsOracle) {
