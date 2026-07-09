@@ -141,6 +141,17 @@ to `a-z` at build time, so every query matches case-insensitively at **zero quer
 cost** (`Locate` offsets still point into the original text). Only ASCII case is
 folded — non-ASCII / UTF-8 bytes stay exact.
 
+**Token-level index (`TokenFMIndex`).** The byte `FMIndex` matches byte substrings.
+For LLM decontamination the unit is *N consecutive tokens* (e.g. a 13-token overlap,
+GPT-3 style), so `TokenFMIndex` builds the same structure over a `uint32` token-id
+array instead of bytes — same methods (`Count`/`Locate`/`LocateDocs`/`LongestMatch`/
+`NextTokenCounts`/`Extract`), but lengths and positions are in tokens, `Extract`
+returns token ids, and `NextTokenCounts` returns `(token_id, count)` — a real
+unbounded-context **token n-gram model** (Infini-gram-style). You tokenize the corpus
+and queries with your own tokenizer; the index has no tokenizer dependency. (In-memory
+build + query today; serialization and a shared templated core with the byte index are
+follow-ups.)
+
 **Fuzzy contamination & n-gram stats.** Exact-13-gram matching misses paraphrased or
 truncated contamination. `LongestMatch(query)` answers "how long a contiguous span of
 this benchmark item appears in the corpus" — a partial-overlap signal that survives
@@ -188,6 +199,7 @@ cmake --build build -j4
 
 ```
 src/index/fmindex/   the library (headers + FMIndex.cpp); ports into Milvus core
+                     (TokenFMIndex.h = token-level variant over uint32 token ids)
 third_party/libsais/ vendored suffix-array builder, 32- and 64-bit (Apache-2.0)
 test/                dependency-free brute-force-oracle tests
 bench/               self-contained benchmark harnesses (build / count / mmap)
