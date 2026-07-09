@@ -44,9 +44,13 @@ doc_start   = [ 0,           13,           26 ]   // byte offset where each doc 
   buffer is treated as one document.
 - Bytes are arbitrary — UTF-8 text, raw logs, `{A,C,G,T}`, anything. Matching is
   byte-exact and case-sensitive.
-- One index handles corpora up to **~2 GB**; for larger data, build one index per
-  shard/segment and union the results (this is how it plugs into Milvus, one index
-  per sealed segment).
+- One index handles corpora up to **2^63 bytes**: the suffix array is built with
+  32-bit indices under 2 GiB (compact, less build memory) and 64-bit indices at or
+  above it — chosen automatically from `len`. Sampled positions likewise serialize
+  4 bytes wide under 4 GiB, 8 above, so a small corpus keeps a small index. Going
+  past 2 GiB in one index is mostly limited by **build memory** (~30× the corpus),
+  so for large data prefer one index per shard/segment (this is how it plugs into
+  Milvus, one index per sealed segment).
 - **Document boundaries are respected on attribution.** Because documents are
   concatenated, a pattern can straddle a seam (e.g. docs `"ab"`,`"cd"` — `"bc"`
   exists in the buffer but in no document). Raw `Count`/`Locate` work over the
@@ -156,7 +160,7 @@ strings (needs forward navigation), incremental update, Unicode-aware case foldi
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
-./build/test_fmindex     # 45 tests / 383k checks (concurrency, Extract, corrupt-blob)
+./build/test_fmindex     # 48 tests / 391k checks (concurrency, Extract, 32/64-bit)
 ./build/demo             # tiny walkthrough of the anchored + case-insensitive API
 ./build/bench_fmindex    # build / count / batch / locate / size
 ./build/bench_mmap       # in-RAM vs mmap query throughput
@@ -166,7 +170,7 @@ cmake --build build -j4
 
 ```
 src/index/fmindex/   the library (headers + FMIndex.cpp); ports into Milvus core
-third_party/libsais/ vendored suffix-array builder (Apache-2.0)
+third_party/libsais/ vendored suffix-array builder, 32- and 64-bit (Apache-2.0)
 test/                dependency-free brute-force-oracle tests
 bench/               self-contained benchmark harnesses (build / count / mmap)
 DESIGN.md            architecture, algorithms, correctness, serialization format

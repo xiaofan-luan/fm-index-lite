@@ -19,7 +19,8 @@ include_directories(${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}
 
 add_library(fmindex STATIC
     src/index/fmindex/FMIndex.cpp
-    third_party/libsais/libsais.c)
+    third_party/libsais/libsais.c
+    third_party/libsais/libsais64.c)  # int64 SA for corpora >= 2 GiB
 
 add_executable(test_fmindex test/test_fmindex.cpp)
 target_include_directories(test_fmindex PRIVATE ${CMAKE_SOURCE_DIR}/test)

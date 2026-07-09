@@ -1023,6 +1023,76 @@ TEST(FMIndex, MappedOpenFailsOnCorruptFile) {
     std::remove(path.c_str());
 }
 
+TEST(SuffixArray, Bytes32And64Agree) {
+    std::mt19937 rng(2027);
+    for (int trial = 0; trial < 40; ++trial) {
+        size_t n = 1 + rng() % 400;
+        std::vector<uint8_t> text(n);
+        for (auto& c : text) c = static_cast<uint8_t>(rng() % 5);
+        auto sa32 = build_suffix_array_bytes(text.data(), n);
+        auto sa64 = build_suffix_array_bytes64(text.data(), n);
+        CHECK_EQ(sa32.size(), sa64.size());
+        for (size_t i = 0; i < sa32.size(); ++i) {
+            CHECK(static_cast<int64_t>(sa32[i]) == sa64[i]);
+        }
+    }
+}
+
+TEST(FMIndex, WideAndNarrowBuildsAgree) {
+    // force_wide builds the 64-bit SA path (and 8-byte position storage) on
+    // small inputs; it must produce identical query results to the 32-bit path.
+    std::mt19937 rng(31);
+    std::string text;
+    std::vector<uint64_t> starts;
+    for (int d = 0; d < 200; ++d) {
+        starts.push_back(text.size());
+        size_t dl = 3 + rng() % 30;
+        for (size_t i = 0; i < dl; ++i) text += char('a' + rng() % 6);
+    }
+    FMIndex narrow, wide;
+    narrow.Build(bytes(text), text.size(), 8, /*case_insensitive=*/false,
+                 /*force_wide=*/false);
+    wide.Build(bytes(text), text.size(), 8, /*case_insensitive=*/false,
+               /*force_wide=*/true);
+    narrow.SetDocStarts(starts);
+    wide.SetDocStarts(starts);
+    CHECK(!narrow.wide());
+    CHECK(wide.wide());
+
+    for (int q = 0; q < 200; ++q) {
+        size_t pl = 1 + rng() % 5;
+        std::string p;
+        for (size_t j = 0; j < pl; ++j) p += char('a' + rng() % 6);
+        CHECK_EQ(narrow.Count(bytes(p), p.size()),
+                 wide.Count(bytes(p), p.size()));
+        CHECK_EQ(narrow.Locate(bytes(p), p.size()),
+                 wide.Locate(bytes(p), p.size()));
+        CHECK_EQ(narrow.LocateDocs(bytes(p), p.size()),
+                 wide.LocateDocs(bytes(p), p.size()));
+    }
+    // Extract agrees too.
+    CHECK_EQ(narrow.Extract(0, 50), wide.Extract(0, 50));
+}
+
+TEST(FMIndex, WideStorageSurvivesRoundTrip) {
+    // Exercises the 8-byte sampled-SA serialization path on small data.
+    std::string text = "the quick brown fox jumps over the lazy dog again";
+    FMIndex fm;
+    fm.Build(bytes(text), text.size(), 4, /*case_insensitive=*/false,
+             /*force_wide=*/true);
+    CHECK(fm.wide());
+    std::string blob = fm.Serialize();
+    FMIndex fm2 = FMIndex::Deserialize(blob);
+    CHECK(fm2.valid());
+    CHECK(fm2.wide());  // flag round-tripped, read back 8-byte samples
+    for (std::string p : {"the", "quick", "dog", "zzz", "o", "again"}) {
+        CHECK_EQ(fm.Count(bytes(p), p.size()), fm2.Count(bytes(p), p.size()));
+        CHECK_EQ(fm.Locate(bytes(p), p.size()), fm2.Locate(bytes(p), p.size()));
+    }
+    // Byte-identical re-serialization (deterministic wide layout).
+    CHECK(fm2.Serialize() == blob);
+}
+
 int
 main() {
     setvbuf(stdout, nullptr, _IONBF, 0);  // unbuffered: survive a crash

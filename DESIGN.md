@@ -54,17 +54,21 @@ FMIndex
  ├─ WaveletMatrix4(QuadVector per level)         rank over the BWT   ← query hot path
  │    └─ QuadVector (2-bit packed + SWAR rank + 2-level directory)
  ├─ BitVector     (rank9)                        the sampled-row bitmap
- ├─ C-table       (uint32[σ])                    LF-mapping base
+ ├─ C-table       (uint64[σ])                    LF-mapping base
  ├─ first_[σ]     (per-symbol map_zero baseline) 2 ranks/level, not 3
- ├─ sampled SA    (uint32[], by row)             locate
+ ├─ sampled SA    (uint64[] RAM, 4/8B on disk)   locate
  └─ doc_start[]   (uint64[], sorted)             (pk, offset) mapping
 ```
 
 ### 3.1 SuffixArray — `SuffixArray.h`
-Thin wrapper over **libsais** (`libsais_int`, SA-IS, linear time, Apache-2.0,
-vendored in `third_party/libsais`). Input is the int32 symbol buffer `t`
-(alphabet size σ); output is the standard suffix array. `int32` indices bound
-the corpus to `< 2^31` bytes (a 64-bit path is a later change).
+Thin wrapper over **libsais** (SA-IS, linear time, Apache-2.0, vendored in
+`third_party/libsais`). The SA is built **directly over the bytes** (`libsais`,
+not `libsais_int`) — the dense byte→id remap is order-preserving and libsais
+treats end-of-string as the smallest symbol, exactly our sentinel, so no int32
+copy of the text is materialized. Two tiers, chosen by length: `libsais` (32-bit
+SA) under 2 GiB for less build memory, `libsais64` (64-bit SA) at or above it,
+up to `2^63` bytes. Both return the sentinel-terminated SA (length n+1, sentinel
+prepended in place); results are identical, verified by a differential test.
 
 ### 3.2 BitVector — `BitVector.h` (rank9)
 Plain bit vector with `rank1`/`rank0`. Directory is **rank9** (Vigna, WEA 2008):
@@ -175,18 +179,21 @@ level buys ~1% — deliberately not done. The two real levers:
 
 ## 7. Serialization format
 
-A flat little-endian blob (format v4): a header — magic `"FMIX"`, version,
-`sa_sample_rate`, `σ`, `qlevels`, a case-fold flag (in the former alignment pad),
-`text_len`, the 256-entry `byte→id` map, the
-C-table, per-level `start[4]`, then the section sizes (per-level quad word counts,
-sampled word count, sample count, doc count) — followed by the large payload
-arrays, **each padded to an 8-byte boundary**: per quad level the 2-bit words,
-then the sampled-row bit words, the `uint32` sampled-SA values, and the `uint64`
-`doc_start`. The 8-byte alignment is what lets `LoadView` point the quad/sampled
-words at mmap'd memory (zero-copy). Derived structures (wavelet/quad rank
-directories, `first_`) are **recomputed on load**, so they cost nothing on disk —
-they are in-RAM only. `sa_sample_vals` is `uint32` (corpus `< 2^32`), halving the
-sample array vs `uint64` at no query cost.
+A flat little-endian blob (format v5): a header — magic `"FMIX"`, version,
+`sa_sample_rate`, `σ`, `qlevels`, a flags word (bit 0 = case-fold, bit 1 = 8-byte
+position storage; in the former alignment pad), `text_len`, the 256-entry
+`byte→id` map, the `uint64` C-table, per-level `start[4]`, then the section sizes
+(per-level quad word counts, sampled word count, sample count, doc count) —
+followed by the large payload arrays, **each padded to an 8-byte boundary**: per
+quad level the 2-bit words, then the sampled-row bit words, the sampled-SA values,
+and the `uint64` `doc_start`. The 8-byte alignment is what lets `LoadView` point
+the quad/sampled words at mmap'd memory (zero-copy). Derived structures
+(wavelet/quad rank directories, `first_`, `id_to_byte`, `isa_sample`) are
+**recomputed on load**, so they cost nothing on disk — they are in-RAM only. The
+sampled-SA values serialize **4 bytes wide when the corpus is < 4 GiB, 8 above**
+(the flags bit), so a small corpus keeps a small index while >4 GiB stays
+representable; they are copied (not viewed) on load, so the width conversion is
+free.
 
 ## 8. Performance summary (4 MB, arm64)
 
@@ -262,8 +269,12 @@ column's concatenated row values + `doc_start`; queries fan out and aggregate.
 
 ## 10. Limitations / future
 
-- **Corpus `< 2^31` bytes** per index (int32 SA + uint32 samples). Per-segment in
-  Milvus this is fine; a 64-bit path (`libsais64`) is a later change.
+- **Corpus `< 2^63` bytes** per index (32-bit SA under 2 GiB, `libsais64` above;
+  positions stored 4 or 8 bytes by size). In practice **build memory** (~30× the
+  corpus, dominated by the transient SA) is the real ceiling long before 2^63, so
+  the per-segment shard model stays the way to scale — reducing build memory is
+  the open item (byte-SA already lands the text copy; the wavelet build buffers
+  and the int64 SA are next).
 - **DNA size** is behind sdsl; closing it (sentinel removal → 2 quad levels, or a
   bwa-mem2-style 2-bit occ) costs effort for a non-target workload.
 - **Repetitive corpora**: an r-index (RLBWT) could be ~10× smaller on heavily

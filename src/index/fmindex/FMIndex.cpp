@@ -11,15 +11,19 @@ namespace milvus::index::fmindex {
 
 void
 FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate,
-               bool case_insensitive) {
-    // The suffix array uses int32 indices over the length+1 buffer; reject
-    // corpora that would overflow rather than silently corrupt the index.
-    if (len >= static_cast<size_t>(INT32_MAX)) {
-        throw std::length_error(
-            "FMIndex: corpus too large (>= 2^31 bytes); use a 64-bit build");
+               bool case_insensitive, bool force_wide) {
+    // Suffix array is built with 32-bit indices under 2 GiB (compact) and 64-bit
+    // indices at or above it (libsais64). Only the astronomically large 2^63
+    // ceiling of the 64-bit path is a hard error.
+    const bool use64 = force_wide || len >= (static_cast<size_t>(INT32_MAX));
+    if (len >= (static_cast<size_t>(1) << 63)) {
+        throw std::length_error("FMIndex: corpus too large (>= 2^63 bytes)");
     }
     sa_sample_rate_ = sa_sample_rate == 0 ? 1 : sa_sample_rate;
     case_fold_ = case_insensitive;
+    // Store positions 8 bytes wide once they can exceed uint32 (>= 4 GiB), or
+    // when forced (lets tests exercise the wide path on small inputs).
+    wide_storage_ = force_wide || len >= (static_cast<size_t>(1) << 32);
     text_len_ = len;
     doc_start_ = {0};  // default: whole corpus is one document
 
@@ -55,37 +59,62 @@ FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate,
     }
     qlevels_ = (bits + 1) / 2;  // 2 bits per quad level
 
-    // 2. remapped symbols + sentinel 0
-    std::vector<uint32_t> t(len + 1);
-    for (size_t i = 0; i < len; ++i) {
-        t[i] = static_cast<uint32_t>(byte_to_id_[data[i]]);
-    }
-    t[len] = 0;
+    // 2. suffix array — built directly over bytes (see build_suffix_array_bytes),
+    //    so no int32 dense-id copy of the whole text is materialized. For a
+    //    case-insensitive index the SA must sort by the folded bytes, so feed a
+    //    folded copy; otherwise libsais reads the caller's buffer in place.
+    const size_t m = len + 1;
+    // 32-bit SA under 2 GiB, 64-bit at/above it (or when forced). Only one of
+    // the two buffers is allocated; sa_at() reads whichever, as a 64-bit value.
+    std::vector<int32_t> sa32;
+    std::vector<int64_t> sa64;
+    {
+        std::vector<uint8_t> folded;
+        const uint8_t* sa_input = data;
+        if (case_fold_) {
+            folded.resize(len);
+            for (size_t i = 0; i < len; ++i) {
+                folded[i] = fold(data[i]);
+            }
+            sa_input = folded.data();
+        }
+        if (use64) {
+            sa64 = build_suffix_array_bytes64(sa_input, len);
+        } else {
+            sa32 = build_suffix_array_bytes(sa_input, len);
+        }
+    }  // folded buffer freed here
+    auto sa_at = [&](size_t i) -> uint64_t {
+        return use64 ? static_cast<uint64_t>(sa64[i])
+                     : static_cast<uint64_t>(sa32[i]);
+    };
 
-    // 3. suffix array (libsais)
-    std::vector<uint32_t> sa = build_suffix_array(t);
-
-    // 4. BWT of dense ids
-    const size_t m = t.size();
+    // 3. BWT of dense ids, computed inline from data + sa (no dense-id text
+    //    array). bwt[i] is the symbol preceding row i's suffix; row 0's suffix
+    //    starts at position 0 so its predecessor wraps to the sentinel (0). The
+    //    aliased byte_to_id_ maps both letter cases to one id in folded mode.
     std::vector<uint32_t> bwt(m);
     for (size_t i = 0; i < m; ++i) {
-        bwt[i] = (sa[i] == 0) ? t[m - 1] : t[sa[i] - 1];
+        uint64_t v = sa_at(i);
+        bwt[i] = (v == 0) ? 0u
+                          : static_cast<uint32_t>(byte_to_id_[data[v - 1]]);
     }
 
-    // 5. C-table over sigma_
+    // 5. C-table over sigma_ (cumulative counts can reach m, so 64-bit)
     c_.assign(sigma_, 0);
     for (uint32_t sym : bwt) {
         c_[sym]++;
     }
-    uint32_t acc = 0;
+    uint64_t acc = 0;
     for (uint32_t c = 0; c < sigma_; ++c) {
-        uint32_t cnt = c_[c];
+        uint64_t cnt = c_[c];
         c_[c] = acc;
         acc += cnt;
     }
 
     // 6. quad wavelet matrix over the BWT + per-symbol map_zero baseline
     wm_ = WaveletMatrix4(bwt, qlevels_);
+    std::vector<uint32_t>().swap(bwt);  // BWT consumed; free before sampling
     first_.resize(sigma_);
     for (uint32_t c = 0; c < sigma_; ++c) {
         first_[c] = wm_.map_zero(c);
@@ -94,14 +123,18 @@ FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate,
     // 7. sampled SA: mark rows whose SA value is a multiple of the rate.
     BitVector samp(m);
     sa_sample_vals_.clear();
+    sa_sample_vals_.reserve(m / sa_sample_rate_ + 1);
     for (size_t i = 0; i < m; ++i) {
-        if (sa[i] % sa_sample_rate_ == 0) {
+        uint64_t v = sa_at(i);
+        if (v % sa_sample_rate_ == 0) {
             samp.set(i);
-            sa_sample_vals_.push_back(sa[i]);
+            sa_sample_vals_.push_back(v);
         }
     }
     samp.build_rank();
     sampled_bv_ = std::move(samp);
+    std::vector<int32_t>().swap(sa32);  // SA no longer needed
+    std::vector<int64_t>().swap(sa64);
 
     buildDerived();
 }
@@ -125,8 +158,8 @@ FMIndex::buildDerived() {
     isa_sample_.assign(text_len_ / sa_sample_rate_ + 1, 0);
     for (size_t r = 0; r < m; ++r) {
         if (sampled_bv_.get(r)) {
-            uint32_t val = sa_sample_vals_[sampled_bv_.rank1(r)];
-            isa_sample_[val / sa_sample_rate_] = static_cast<uint32_t>(r);
+            uint64_t val = sa_sample_vals_[sampled_bv_.rank1(r)];
+            isa_sample_[val / sa_sample_rate_] = static_cast<uint64_t>(r);
         }
     }
 }
@@ -386,7 +419,7 @@ get(const char*& p, const char* end) {
     return v;
 }
 constexpr uint32_t kMagic = 0x464D4958;  // "FMIX"
-constexpr uint32_t kFormatVersion = 4;
+constexpr uint32_t kFormatVersion = 5;
 }  // namespace
 
 void
@@ -396,14 +429,15 @@ FMIndex::writeHeader(std::string& s) const {
     put(s, sa_sample_rate_);
     put(s, sigma_);
     put(s, qlevels_);
-    // case-fold flag lives in the former 4-byte alignment pad (keeps text_len
-    // 8-aligned); 0 = exact, 1 = ASCII case-insensitive.
-    put(s, static_cast<uint32_t>(case_fold_ ? 1 : 0));
+    // Flags live in the former 4-byte alignment pad (keeps text_len 8-aligned):
+    // bit 0 = ASCII case-insensitive, bit 1 = 8-byte sampled-SA storage.
+    put(s, static_cast<uint32_t>((case_fold_ ? 1u : 0u) |
+                                 (wide_storage_ ? 2u : 0u)));
     put(s, text_len_);
     for (int32_t v : byte_to_id_) {
         put(s, v);
     }
-    for (uint32_t c : c_) {
+    for (uint64_t c : c_) {
         put(s, c);
     }
     for (uint32_t l = 0; l < qlevels_; ++l) {
@@ -439,8 +473,15 @@ FMIndex::Serialize() const {
     s.append(reinterpret_cast<const char*>(sampled_bv_.words()),
              sampled_bv_.word_count() * sizeof(uint64_t));
     align8();
-    s.append(reinterpret_cast<const char*>(sa_sample_vals_.data()),
-             sa_sample_vals_.size() * sizeof(uint32_t));
+    if (wide_storage_) {
+        s.append(reinterpret_cast<const char*>(sa_sample_vals_.data()),
+                 sa_sample_vals_.size() * sizeof(uint64_t));
+    } else {
+        for (uint64_t v : sa_sample_vals_) {
+            uint32_t x = static_cast<uint32_t>(v);
+            s.append(reinterpret_cast<const char*>(&x), sizeof(x));
+        }
+    }
     align8();
     s.append(reinterpret_cast<const char*>(doc_start_.data()),
              doc_start_.size() * sizeof(uint64_t));
@@ -476,7 +517,14 @@ FMIndex::SerializeToFile(const std::string& path) const {
     pad8();
     emit(sampled_bv_.words(), sampled_bv_.word_count() * sizeof(uint64_t));
     pad8();
-    emit(sa_sample_vals_.data(), sa_sample_vals_.size() * sizeof(uint32_t));
+    if (wide_storage_) {
+        emit(sa_sample_vals_.data(), sa_sample_vals_.size() * sizeof(uint64_t));
+    } else {
+        for (uint64_t v : sa_sample_vals_) {
+            uint32_t x = static_cast<uint32_t>(v);
+            emit(&x, sizeof(x));
+        }
+    }
     pad8();
     emit(doc_start_.data(), doc_start_.size() * sizeof(uint64_t));
     std::fclose(f);
@@ -495,7 +543,9 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         sa_sample_rate_ = get<uint32_t>(p, end);
         sigma_ = get<uint32_t>(p, end);
         qlevels_ = get<uint32_t>(p, end);
-        case_fold_ = get<uint32_t>(p, end) != 0;  // former pad, now case flag
+        uint32_t flags = get<uint32_t>(p, end);  // former pad, now flags
+        case_fold_ = (flags & 1u) != 0;
+        wide_storage_ = (flags & 2u) != 0;
         if (sigma_ == 0 || sigma_ > 257 || qlevels_ > 5) {
             return false;
         }
@@ -511,7 +561,7 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         }
         c_.resize(sigma_);
         for (uint32_t i = 0; i < sigma_; ++i) {
-            c_[i] = get<uint32_t>(p, end);
+            c_[i] = get<uint64_t>(p, end);
         }
         std::vector<std::array<size_t, 4>> starts(qlevels_);
         for (uint32_t l = 0; l < qlevels_; ++l) {
@@ -570,9 +620,18 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         const uint64_t* sw = align_view(sampled_nw * sizeof(uint64_t));
         sampled_bv_ = BitVector::from_view(m, sw, sampled_nw);
         // small arrays copied (cheap, keeps them owned/aligned-independent)
-        const uint64_t* svp = align_view(n_samples * sizeof(uint32_t));
+        const size_t pw = wide_storage_ ? 8 : 4;
+        const uint64_t* svp = align_view(n_samples * pw);
         sa_sample_vals_.resize(n_samples);
-        std::memcpy(sa_sample_vals_.data(), svp, n_samples * sizeof(uint32_t));
+        if (pw == 8) {
+            std::memcpy(sa_sample_vals_.data(), svp,
+                        n_samples * sizeof(uint64_t));
+        } else {
+            const uint32_t* s32 = reinterpret_cast<const uint32_t*>(svp);
+            for (uint64_t i = 0; i < n_samples; ++i) {
+                sa_sample_vals_[i] = s32[i];
+            }
+        }
         const uint64_t* dsp = align_view(n_docs * sizeof(uint64_t));
         doc_start_.resize(n_docs);
         std::memcpy(doc_start_.data(), dsp, n_docs * sizeof(uint64_t));

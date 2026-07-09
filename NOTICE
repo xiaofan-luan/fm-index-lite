@@ -9,10 +9,11 @@ Third-party components
 --------------------------------------------------------------------------------
 
 libsais  (third_party/libsais/)
-  Linear-time suffix-array / BWT construction.
+  Linear-time suffix-array / BWT construction. Both the 32-bit build
+  (libsais.c/.h) and the 64-bit build (libsais64.c/.h) are vendored.
   Copyright (c) 2021-2025 Ilya Grebnov <ilya.grebnov@gmail.com>
   Licensed under the Apache License, Version 2.0.
-  Source: https://github.com/IlyaGrebnov/libsais
+  Source: https://github.com/IlyaGrebnov/libsais (v2.10.4)
   Vendored unmodified; see third_party/libsais/LICENSE.
 
 --------------------------------------------------------------------------------

@@ -41,9 +41,14 @@ class FMIndex {
     //                   match case-insensitively with zero query-time cost. Only
     //                   ASCII case is folded; non-ASCII / UTF-8 bytes are left
     //                   exact. Locate offsets still refer to the original text.
+    //   force_wide      normally the suffix array is built with 32-bit indices
+    //                   for len < 2 GiB (less memory) and 64-bit indices above;
+    //                   set true to force the 64-bit path regardless (used to
+    //                   exercise the wide path on small inputs in tests). The
+    //                   resulting index is identical either way.
     void
     Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate = 32,
-          bool case_insensitive = false);
+          bool case_insensitive = false, bool force_wide = false);
 
     // Half-open SA interval [lo, hi) for pattern; lo==hi means no match.
     std::pair<size_t, size_t>
@@ -123,9 +128,15 @@ class FMIndex {
     qlevels() const {
         return qlevels_;
     }
-    uint32_t
+    uint64_t
     c_at(uint32_t c) const {
         return c_[c];
+    }
+    // True if sampled-SA positions are stored 8 bytes wide (corpus >= 4 GiB, or
+    // force_wide); false for the compact 4-byte storage.
+    bool
+    wide() const {
+        return wide_storage_;
     }
     bool
     case_insensitive() const {
@@ -178,21 +189,22 @@ class FMIndex {
 
     uint32_t sa_sample_rate_ = 1;
     bool case_fold_ = false;             // ASCII A-Z folded to a-z at build time
+    bool wide_storage_ = false;          // sampled-SA positions stored 8B (>=4GiB)
     uint64_t text_len_ = 0;              // original byte count (no sentinel)
     uint32_t sigma_ = 1;                 // dense alphabet size incl sentinel
     uint32_t qlevels_ = 0;              // ceil(ceil(log2(sigma_)) / 2)
     std::array<int32_t, 256> byte_to_id_{};  // byte -> dense id, -1 if absent
     WaveletMatrix4 wm_;                 // 4-ary quad matrix over the BWT
-    std::vector<uint32_t> c_;           // C-table, size sigma_
+    std::vector<uint64_t> c_;           // C-table, size sigma_ (counts up to len)
     std::vector<size_t> first_;         // per-symbol map_zero (derived, not serialized)
     BitVector sampled_bv_;              // row is SA-sampled? rank = sample index
-    // SA values of sampled rows, in row order. uint32 (text < 2^32) halves the
-    // sample storage vs uint64 with no query cost — plain array load either way.
-    std::vector<uint32_t> sa_sample_vals_;
+    // SA values of sampled rows, in row order. Held as uint64 in RAM; serialized
+    // at 4 bytes when len < 2^32, else 8 (so small corpora keep the small index).
+    std::vector<uint64_t> sa_sample_vals_;
     std::vector<uint64_t> doc_start_;  // document boundaries
     // Derived, in-RAM only (rebuilt on load, never serialized):
     std::vector<uint8_t> id_to_byte_;    // dense id -> byte (inverse of byte_to_id_)
-    std::vector<uint32_t> isa_sample_;   // isa_sample_[k] = row whose SA value = k*rate
+    std::vector<uint64_t> isa_sample_;   // isa_sample_[k] = row whose SA value = k*rate
     std::vector<uint8_t> owned_blob_;  // backs the views when Deserialized by copy
 };
 
