@@ -139,7 +139,8 @@ strings (needs forward navigation), incremental update, Unicode-aware case foldi
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
-./build/test_fmindex     # 35 tests / 380k checks
+./build/test_fmindex     # 39 tests / 380k checks
+./build/demo             # tiny walkthrough of the anchored + case-insensitive API
 ./build/bench_fmindex    # build / count / batch / locate / size
 ./build/bench_mmap       # in-RAM vs mmap query throughput
 ```

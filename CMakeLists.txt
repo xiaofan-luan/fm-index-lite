@@ -29,5 +29,8 @@ target_link_libraries(bench_fmindex PRIVATE fmindex)
 add_executable(bench_mmap bench/bench_mmap.cpp)
 target_link_libraries(bench_mmap PRIVATE fmindex)
 
+add_executable(demo bench/demo.cpp)
+target_link_libraries(demo PRIVATE fmindex)
+
 enable_testing()
 add_test(NAME fmindex_tests COMMAND test_fmindex)
