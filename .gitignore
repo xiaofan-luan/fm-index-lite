@@ -1,0 +1,9 @@
+# build artifacts
+build/
+target/
+*.o
+*.a
+
+# benchmark outputs / index files
+results_*.txt
+*.fmix

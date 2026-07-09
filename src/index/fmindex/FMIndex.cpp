@@ -1,0 +1,454 @@
+// Licensed to the LF AI & Data foundation under Apache-2.0.
+// Portions translated from Lance (lance_index::scalar::fmindex), Apache-2.0.
+#include "index/fmindex/FMIndex.h"
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+#include "index/fmindex/SuffixArray.h"
+
+namespace milvus::index::fmindex {
+
+void
+FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate) {
+    // The suffix array uses int32 indices over the length+1 buffer; reject
+    // corpora that would overflow rather than silently corrupt the index.
+    if (len >= static_cast<size_t>(INT32_MAX)) {
+        throw std::length_error(
+            "FMIndex: corpus too large (>= 2^31 bytes); use a 64-bit build");
+    }
+    sa_sample_rate_ = sa_sample_rate == 0 ? 1 : sa_sample_rate;
+    text_len_ = len;
+    doc_start_ = {0};  // default: whole corpus is one document
+
+    // 1. dense alphabet: distinct bytes -> ids 1..sigma-1 (0 = sentinel),
+    //    order-preserving so lexicographic order of ids matches bytes.
+    std::array<bool, 256> present{};
+    for (size_t i = 0; i < len; ++i) {
+        present[data[i]] = true;
+    }
+    byte_to_id_.fill(-1);
+    uint32_t id = 1;
+    for (int b = 0; b < 256; ++b) {
+        if (present[b]) {
+            byte_to_id_[b] = static_cast<int32_t>(id++);
+        }
+    }
+    sigma_ = id;  // sentinel + number of distinct bytes
+    uint32_t bits = 1;
+    while ((1u << bits) < sigma_) {
+        ++bits;
+    }
+    qlevels_ = (bits + 1) / 2;  // 2 bits per quad level
+
+    // 2. remapped symbols + sentinel 0
+    std::vector<uint32_t> t(len + 1);
+    for (size_t i = 0; i < len; ++i) {
+        t[i] = static_cast<uint32_t>(byte_to_id_[data[i]]);
+    }
+    t[len] = 0;
+
+    // 3. suffix array (libsais)
+    std::vector<uint32_t> sa = build_suffix_array(t);
+
+    // 4. BWT of dense ids
+    const size_t m = t.size();
+    std::vector<uint32_t> bwt(m);
+    for (size_t i = 0; i < m; ++i) {
+        bwt[i] = (sa[i] == 0) ? t[m - 1] : t[sa[i] - 1];
+    }
+
+    // 5. C-table over sigma_
+    c_.assign(sigma_, 0);
+    for (uint32_t sym : bwt) {
+        c_[sym]++;
+    }
+    uint32_t acc = 0;
+    for (uint32_t c = 0; c < sigma_; ++c) {
+        uint32_t cnt = c_[c];
+        c_[c] = acc;
+        acc += cnt;
+    }
+
+    // 6. quad wavelet matrix over the BWT + per-symbol map_zero baseline
+    wm_ = WaveletMatrix4(bwt, qlevels_);
+    first_.resize(sigma_);
+    for (uint32_t c = 0; c < sigma_; ++c) {
+        first_[c] = wm_.map_zero(c);
+    }
+
+    // 7. sampled SA: mark rows whose SA value is a multiple of the rate.
+    BitVector samp(m);
+    sa_sample_vals_.clear();
+    for (size_t i = 0; i < m; ++i) {
+        if (sa[i] % sa_sample_rate_ == 0) {
+            samp.set(i);
+            sa_sample_vals_.push_back(sa[i]);
+        }
+    }
+    samp.build_rank();
+    sampled_bv_ = std::move(samp);
+}
+
+size_t
+FMIndex::LF(size_t i) const {
+    uint32_t sym = wm_.access(i);
+    return c_[sym] + wm_.rank(sym, i);
+}
+
+std::pair<size_t, size_t>
+FMIndex::BackwardSearch(const uint8_t* pattern, size_t plen) const {
+    if (c_.empty()) {
+        return {0, 0};  // default-constructed / failed-Deserialize index
+    }
+    const size_t m = text_len_ + 1;
+    if (plen == 0) {
+        return {0, m};
+    }
+    size_t lo = 0, hi = m;
+    for (size_t k = plen; k-- > 0;) {
+        int32_t id = byte_to_id_[pattern[k]];
+        if (id < 0) {
+            return {0, 0};  // byte never appears in the corpus
+        }
+        auto pp = wm_.map2(static_cast<uint32_t>(id), lo, hi);
+        size_t base = c_[id] - first_[id];
+        lo = base + pp.first;
+        hi = base + pp.second;
+        if (lo >= hi) {
+            return {0, 0};
+        }
+    }
+    return {lo, hi};
+}
+
+std::vector<size_t>
+FMIndex::CountBatch(
+    const std::vector<std::pair<const uint8_t*, size_t>>& patterns) const {
+    const size_t m = text_len_ + 1;
+    const size_t B = patterns.size();
+    std::vector<size_t> result(B, 0);
+    if (c_.empty()) {
+        return result;  // default-constructed / failed-Deserialize index
+    }
+
+    // Process in small tiles so the set of in-flight positions stays L1-resident
+    // while still giving enough memory-level parallelism to overlap misses.
+    constexpr size_t kTile = 32;
+
+    std::vector<uint32_t> ids(kTile);
+    std::vector<size_t> blo(kTile), bhi(kTile);
+    std::vector<size_t> qslot(kTile);
+    std::vector<size_t> lo(kTile), hi(kTile);
+    std::vector<int64_t> posn(kTile);
+    std::vector<uint8_t> active(kTile);
+
+    for (size_t t0 = 0; t0 < B; t0 += kTile) {
+        size_t t1 = std::min(t0 + kTile, B);
+        size_t tn = t1 - t0;
+        for (size_t s = 0; s < tn; ++s) {
+            size_t len = patterns[t0 + s].second;
+            if (len == 0) {
+                result[t0 + s] = m;
+                active[s] = 0;
+                continue;
+            }
+            lo[s] = 0;
+            hi[s] = m;
+            posn[s] = static_cast<int64_t>(len) - 1;
+            active[s] = 1;
+        }
+        for (;;) {
+            size_t k = 0;  // active-in-tile count this round
+            for (size_t s = 0; s < tn; ++s) {
+                if (!active[s]) {
+                    continue;
+                }
+                int32_t id = byte_to_id_[patterns[t0 + s].first[posn[s]]];
+                if (id < 0) {
+                    active[s] = 0;
+                    continue;
+                }
+                ids[k] = static_cast<uint32_t>(id);
+                blo[k] = lo[s];
+                bhi[k] = hi[s];
+                qslot[k] = s;
+                ++k;
+            }
+            if (k == 0) {
+                break;
+            }
+            wm_.map_batch(ids.data(), blo.data(), bhi.data(), k);
+            for (size_t j = 0; j < k; ++j) {
+                size_t s = qslot[j];
+                uint32_t id = ids[j];
+                size_t base = c_[id] - first_[id];
+                size_t nlo = base + blo[j];
+                size_t nhi = base + bhi[j];
+                if (nlo >= nhi) {
+                    active[s] = 0;
+                    continue;
+                }
+                lo[s] = nlo;
+                hi[s] = nhi;
+                if (--posn[s] < 0) {
+                    result[t0 + s] = nhi - nlo;
+                    active[s] = 0;
+                }
+            }
+        }
+    }
+    return result;
+}
+
+std::vector<uint64_t>
+FMIndex::Locate(const uint8_t* pattern, size_t plen) const {
+    auto r = BackwardSearch(pattern, plen);
+    std::vector<uint64_t> out;
+    for (size_t i = r.first; i < r.second; ++i) {
+        size_t row = i;
+        uint64_t steps = 0;
+        while (!sampled_bv_.get(row)) {
+            row = LF(row);
+            ++steps;
+        }
+        uint64_t pos = sa_sample_vals_[sampled_bv_.rank1(row)] + steps;
+        if (pos < text_len_) {
+            out.push_back(pos);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::vector<std::pair<uint64_t, uint64_t>>
+FMIndex::LocateDocs(const uint8_t* pattern, size_t plen) const {
+    std::vector<uint64_t> positions = Locate(pattern, plen);
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    out.reserve(positions.size());
+    for (uint64_t pos : positions) {
+        auto it = std::upper_bound(doc_start_.begin(), doc_start_.end(), pos);
+        uint64_t doc_id = static_cast<uint64_t>(it - doc_start_.begin()) - 1;
+        out.emplace_back(doc_id, pos - doc_start_[doc_id]);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// ------------------------- serialization -------------------------
+// Format v3: a header of scalars/metadata/section-sizes, then the large payload
+// arrays each padded to an 8-byte boundary so LoadView can point at them
+// (zero-copy) from mmap'd memory. Only the wavelet/sampled word arrays are
+// viewed; the small sample/doc arrays are copied on load either way.
+namespace {
+template <typename T>
+void
+put(std::string& s, const T& v) {
+    s.append(reinterpret_cast<const char*>(&v), sizeof(T));
+}
+template <typename T>
+T
+get(const char*& p, const char* end) {
+    if (p + sizeof(T) > end) {
+        throw std::runtime_error("fmindex: truncated blob");
+    }
+    T v;
+    std::memcpy(&v, p, sizeof(T));
+    p += sizeof(T);
+    return v;
+}
+constexpr uint32_t kMagic = 0x464D4958;  // "FMIX"
+constexpr uint32_t kFormatVersion = 3;
+}  // namespace
+
+void
+FMIndex::writeHeader(std::string& s) const {
+    put(s, kMagic);
+    put(s, kFormatVersion);
+    put(s, sa_sample_rate_);
+    put(s, sigma_);
+    put(s, qlevels_);
+    put(s, static_cast<uint32_t>(0));  // pad to keep text_len 8-aligned
+    put(s, text_len_);
+    for (int32_t v : byte_to_id_) {
+        put(s, v);
+    }
+    for (uint32_t c : c_) {
+        put(s, c);
+    }
+    for (uint32_t l = 0; l < qlevels_; ++l) {
+        for (int d = 0; d < 4; ++d) {
+            put(s, static_cast<uint64_t>(wm_.starts()[l][d]));
+        }
+    }
+    // section sizes (word counts / element counts)
+    for (uint32_t l = 0; l < qlevels_; ++l) {
+        put(s, static_cast<uint64_t>(wm_.levels_qv()[l].word_count()));
+    }
+    put(s, static_cast<uint64_t>(sampled_bv_.word_count()));
+    put(s, static_cast<uint64_t>(sa_sample_vals_.size()));
+    put(s, static_cast<uint64_t>(doc_start_.size()));
+}
+
+std::string
+FMIndex::Serialize() const {
+    std::string s;
+    writeHeader(s);
+    auto align8 = [&s] {
+        while (s.size() & 7u) {
+            s.push_back('\0');
+        }
+    };
+    for (uint32_t l = 0; l < qlevels_; ++l) {
+        align8();
+        const QuadVector& q = wm_.levels_qv()[l];
+        s.append(reinterpret_cast<const char*>(q.words()),
+                 q.word_count() * sizeof(uint64_t));
+    }
+    align8();
+    s.append(reinterpret_cast<const char*>(sampled_bv_.words()),
+             sampled_bv_.word_count() * sizeof(uint64_t));
+    align8();
+    s.append(reinterpret_cast<const char*>(sa_sample_vals_.data()),
+             sa_sample_vals_.size() * sizeof(uint32_t));
+    align8();
+    s.append(reinterpret_cast<const char*>(doc_start_.data()),
+             doc_start_.size() * sizeof(uint64_t));
+    return s;
+}
+
+bool
+FMIndex::SerializeToFile(const std::string& path) const {
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        return false;
+    }
+    // Only the small header is buffered; the large arrays stream straight to
+    // the file (no intermediate full-index copy).
+    std::string header;
+    writeHeader(header);
+    size_t off = 0;
+    bool ok = true;
+    auto emit = [&](const void* p, size_t n) {
+        if (n && std::fwrite(p, 1, n, f) != n) {
+            ok = false;
+        }
+        off += n;
+    };
+    static const char kZero[8] = {0};
+    auto pad8 = [&] { emit(kZero, (8 - (off & 7u)) & 7u); };
+    emit(header.data(), header.size());
+    for (uint32_t l = 0; l < qlevels_; ++l) {
+        pad8();
+        const QuadVector& q = wm_.levels_qv()[l];
+        emit(q.words(), q.word_count() * sizeof(uint64_t));
+    }
+    pad8();
+    emit(sampled_bv_.words(), sampled_bv_.word_count() * sizeof(uint64_t));
+    pad8();
+    emit(sa_sample_vals_.data(), sa_sample_vals_.size() * sizeof(uint32_t));
+    pad8();
+    emit(doc_start_.data(), doc_start_.size() * sizeof(uint64_t));
+    std::fclose(f);
+    return ok;
+}
+
+bool
+FMIndex::parseView(const uint8_t* base, size_t size) {
+    const char* p = reinterpret_cast<const char*>(base);
+    const char* end = p + size;
+    try {
+        if (get<uint32_t>(p, end) != kMagic ||
+            get<uint32_t>(p, end) != kFormatVersion) {
+            return false;
+        }
+        sa_sample_rate_ = get<uint32_t>(p, end);
+        sigma_ = get<uint32_t>(p, end);
+        qlevels_ = get<uint32_t>(p, end);
+        get<uint32_t>(p, end);  // pad
+        if (sigma_ == 0 || sigma_ > 257 || qlevels_ > 5) {
+            return false;
+        }
+        text_len_ = get<uint64_t>(p, end);
+        for (int i = 0; i < 256; ++i) {
+            byte_to_id_[i] = get<int32_t>(p, end);
+        }
+        c_.resize(sigma_);
+        for (uint32_t i = 0; i < sigma_; ++i) {
+            c_[i] = get<uint32_t>(p, end);
+        }
+        std::vector<std::array<size_t, 4>> starts(qlevels_);
+        for (uint32_t l = 0; l < qlevels_; ++l) {
+            for (int d = 0; d < 4; ++d) {
+                starts[l][d] = static_cast<size_t>(get<uint64_t>(p, end));
+            }
+        }
+        std::vector<uint64_t> qnw(qlevels_);
+        for (uint32_t l = 0; l < qlevels_; ++l) {
+            qnw[l] = get<uint64_t>(p, end);
+        }
+        uint64_t sampled_nw = get<uint64_t>(p, end);
+        uint64_t n_samples = get<uint64_t>(p, end);
+        uint64_t n_docs = get<uint64_t>(p, end);
+
+        const size_t m = text_len_ + 1;
+        auto align_view = [&](uint64_t nbytes) -> const uint64_t* {
+            size_t off = static_cast<size_t>(p - reinterpret_cast<const char*>(
+                                                     base));
+            size_t pad = (8 - (off & 7u)) & 7u;
+            if (p + pad + nbytes > end) {
+                throw std::runtime_error("fmindex: truncated payload");
+            }
+            p += pad;
+            const uint64_t* view = reinterpret_cast<const uint64_t*>(p);
+            p += nbytes;
+            return view;
+        };
+
+        std::vector<QuadVector> qvs;
+        qvs.reserve(qlevels_);
+        for (uint32_t l = 0; l < qlevels_; ++l) {
+            const uint64_t* w = align_view(qnw[l] * sizeof(uint64_t));
+            qvs.push_back(QuadVector::from_view(m, w, qnw[l]));
+        }
+        wm_ = WaveletMatrix4::from_parts(m, qlevels_, std::move(qvs),
+                                         std::move(starts));
+        first_.resize(sigma_);
+        for (uint32_t c = 0; c < sigma_; ++c) {
+            first_[c] = wm_.map_zero(c);
+        }
+        const uint64_t* sw = align_view(sampled_nw * sizeof(uint64_t));
+        sampled_bv_ = BitVector::from_view(m, sw, sampled_nw);
+        // small arrays copied (cheap, keeps them owned/aligned-independent)
+        const uint64_t* svp = align_view(n_samples * sizeof(uint32_t));
+        sa_sample_vals_.resize(n_samples);
+        std::memcpy(sa_sample_vals_.data(), svp, n_samples * sizeof(uint32_t));
+        const uint64_t* dsp = align_view(n_docs * sizeof(uint64_t));
+        doc_start_.resize(n_docs);
+        std::memcpy(doc_start_.data(), dsp, n_docs * sizeof(uint64_t));
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+FMIndex
+FMIndex::LoadView(const uint8_t* base, size_t size) {
+    FMIndex fm;
+    if (!fm.parseView(base, size)) {
+        return {};
+    }
+    return fm;
+}
+
+FMIndex
+FMIndex::Deserialize(const std::string& blob) {
+    FMIndex fm;
+    fm.owned_blob_.assign(blob.begin(), blob.end());
+    if (!fm.parseView(fm.owned_blob_.data(), fm.owned_blob_.size())) {
+        return {};
+    }
+    return fm;
+}
+
+}  // namespace milvus::index::fmindex
