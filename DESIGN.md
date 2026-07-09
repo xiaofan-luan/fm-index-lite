@@ -144,6 +144,19 @@ walks *backward*, so we anchor at a sampled position `≥ pos+len` and walk down
 `sa_sample_vals`). Cost is `O(len + rate)` LF steps; no `select`/ψ needed. On a
 case-folded index the recovered letters are lowercase (original case isn't stored).
 
+**LongestMatch (fuzzy overlap).** For each end position `e` of the query, backward-
+search extends `query[k..e]` leftward while the SA interval stays non-empty; the run
+length when it collapses is the longest match ending at `e`. The global max over all
+`e` is the longest substring of the query present in the corpus — a partial-overlap
+signal for contamination that survives edits an exact n-gram would miss. `O(qlen ·
+match)`, meant for query-sized inputs; a bidirectional index would make it linear.
+
+**NextTokenCounts (n-gram model).** The next byte after context `P` is found by
+counting `P·b` for each corpus byte `b` — one backward search of the `|P|+1` string
+per candidate, `O(σ·|P|)`. The result is the follow distribution `count(P·b)`, so the
+corpus acts as an unbounded-context n-gram LM. The sum can be below `Count(P)` (an
+occurrence of `P` at the very end of the corpus has no following byte).
+
 **CountBatch (throughput).** The workload is latency-bound: each `rank` is a
 data-dependent cache miss and the core would otherwise idle. `CountBatch` runs
 patterns in **tiles of 32**, advancing all active patterns one character per round

@@ -1,6 +1,7 @@
 // Licensed to the LF AI & Data foundation under Apache-2.0.
 #include <algorithm>
 #include <atomic>
+#include <map>
 #include <random>
 #include <string>
 #include <thread>
@@ -1164,6 +1165,78 @@ TEST(FMIndex, MegabyteScaleVsNaiveOracle) {
         CHECK_EQ(narrow.Extract(pos, len), want);
         CHECK_EQ(wide.Extract(pos, len), want);
     }
+}
+
+TEST(FMIndex, LongestMatchVsOracle) {
+    std::string text = "the quick brown fox jumps over the lazy dog";
+    FMIndex fm;
+    fm.Build(bytes(text), text.size(), 4);
+
+    auto naive_count = [&](const std::string& p) {
+        if (p.empty()) return size_t(0);
+        size_t c = 0, pos = 0;
+        while ((pos = text.find(p, pos)) != std::string::npos) { ++c; ++pos; }
+        return c;
+    };
+    // brute-force longest substring of query that occurs in text
+    auto oracle = [&](const std::string& q) {
+        size_t best = 0, bpos = 0;
+        for (size_t i = 0; i < q.size(); ++i)
+            for (size_t len = q.size() - i; len > best; --len)
+                if (text.find(q.substr(i, len)) != std::string::npos) {
+                    best = len; bpos = i; break;
+                }
+        return std::make_pair(best, bpos);
+    };
+
+    for (std::string q : {"a quick brown cat", "the lazy dog", "xyz not here",
+                          "jumps over", "q", "", "brown fox jumps over the l"}) {
+        auto want = oracle(q);
+        auto got = fm.LongestMatch(bytes(q), q.size());
+        CHECK_EQ(got.length, want.first);
+        if (got.length > 0) {
+            // the reported span actually occurs, `count` times
+            std::string sub = q.substr(got.query_pos, got.length);
+            CHECK_EQ(got.count, naive_count(sub));
+            CHECK(text.find(sub) != std::string::npos);
+        }
+    }
+    // fully-contained query -> match is the whole query
+    std::string whole = "quick brown";
+    CHECK_EQ(fm.LongestMatch(bytes(whole), whole.size()).length, whole.size());
+}
+
+TEST(FMIndex, NextTokenCountsVsOracle) {
+    std::string text = "abcabdabxabc";  // "ab" -> c,d,x,c ; "abc" -> (end?) etc.
+    FMIndex fm;
+    fm.Build(bytes(text), text.size(), 4);
+
+    auto check = [&](const std::string& ctx) {
+        // oracle: scan text for ctx, tally the following byte
+        std::map<uint8_t, size_t> want;
+        size_t pos = 0;
+        while ((pos = text.find(ctx, pos)) != std::string::npos) {
+            if (pos + ctx.size() < text.size())
+                want[(uint8_t)text[pos + ctx.size()]]++;
+            ++pos;
+        }
+        auto got = fm.NextTokenCounts(bytes(ctx), ctx.size());
+        // same set of (byte,count), sorted by byte
+        std::vector<std::pair<uint8_t, size_t>> wv(want.begin(), want.end());
+        CHECK_EQ(got, wv);
+        // each entry matches Count(ctx+byte); sum <= Count(ctx)
+        size_t sum = 0;
+        for (auto& [b, cnt] : got) {
+            std::string pc = ctx + char(b);
+            CHECK_EQ(cnt, fm.Count(bytes(pc), pc.size()));
+            sum += cnt;
+        }
+        CHECK(sum <= fm.Count(bytes(ctx), ctx.size()));
+    };
+    check("ab");   // -> c,d,x,c
+    check("abc");
+    check("a");
+    check("z");    // absent -> empty
 }
 
 int

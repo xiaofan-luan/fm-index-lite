@@ -126,6 +126,8 @@ calling `Count` in a loop. It is the right primitive for decontamination
 | `LocatePrefixDocs(pat, len)` / `CountPrefixDocs` | documents that **begin** with `pat` |
 | `LocateSuffixDocs(pat, len)` / `CountSuffixDocs` | documents that **end** with `pat` |
 | `Extract(pos, len)` | recover the original bytes `T[pos, pos+len)` (match context) |
+| `LongestMatch(query, qlen)` | longest substring of `query` present in the corpus (fuzzy overlap) |
+| `NextTokenCounts(pat, len)` | distribution of the byte following `pat` (n-gram model) |
 | `Serialize()` / `SerializeToFile(path)` | persist the index |
 | `Deserialize(blob)` / `LoadView(base, size)` | load (copy / zero-copy mmap) |
 
@@ -138,6 +140,14 @@ document ids. Both need `SetDocStarts` to be meaningful.
 to `a-z` at build time, so every query matches case-insensitively at **zero query-time
 cost** (`Locate` offsets still point into the original text). Only ASCII case is
 folded — non-ASCII / UTF-8 bytes stay exact.
+
+**Fuzzy contamination & n-gram stats.** Exact-13-gram matching misses paraphrased or
+truncated contamination. `LongestMatch(query)` answers "how long a contiguous span of
+this benchmark item appears in the corpus" — a partial-overlap signal that survives
+edits. `NextTokenCounts(P)` gives the distribution of the byte that follows `P`,
+turning the corpus into an unbounded-context n-gram model — `P(next=b | P) = count_b /
+sum` — for probabilistic contamination scoring or corpus statistics. Both use only
+backward search, no extra structure.
 
 **Match context.** `Extract(pos, len)` rebuilds the original bytes from the index
 (no need to keep the source text around) — e.g. to show the line around a hit from

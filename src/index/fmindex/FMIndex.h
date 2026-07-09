@@ -115,6 +115,28 @@ class FMIndex {
     std::string
     Extract(uint64_t pos, size_t len) const;
 
+    // The longest substring of `query` that occurs in the corpus (fuzzy / partial
+    // contamination: "how long a span of this benchmark item appears in training",
+    // which catches paraphrased or truncated overlaps that an exact n-gram misses).
+    // Returns the match length, its start offset in `query`, and how many times it
+    // occurs in the corpus. length == 0 means no single query byte occurs.
+    // O(qlen * match_length) — intended for query-sized inputs.
+    struct LongestMatchResult {
+        size_t length;      // length of the longest matching substring
+        size_t query_pos;   // its start offset within `query`
+        size_t count;       // number of occurrences in the corpus
+    };
+    LongestMatchResult
+    LongestMatch(const uint8_t* query, size_t qlen) const;
+
+    // Distribution of the byte that FOLLOWS context P: (byte, count) for every
+    // byte b such that P·b occurs, sorted by byte. This turns the corpus into an
+    // n-gram model — P(next=b | P) = count_b / sum(counts). The sum can be less
+    // than Count(P): an occurrence of P at the very end of the corpus has no
+    // following byte. O(sigma * plen).
+    std::vector<std::pair<uint8_t, size_t>>
+    NextTokenCounts(const uint8_t* pattern, size_t plen) const;
+
     // --- accessors used by tests ---
     size_t
     bwt_size() const {

@@ -217,6 +217,69 @@ FMIndex::Extract(uint64_t pos, size_t len) const {
     return out;
 }
 
+FMIndex::LongestMatchResult
+FMIndex::LongestMatch(const uint8_t* query, size_t qlen) const {
+    LongestMatchResult best{0, 0, 0};
+    if (c_.empty()) {
+        return best;
+    }
+    const size_t m = text_len_ + 1;
+    // For each end position e, extend the match backward (query[k..e]) as far as
+    // the SA interval stays non-empty; track the global longest across all e.
+    for (size_t e = 0; e < qlen; ++e) {
+        size_t lo = 0, hi = m, len = 0;
+        for (size_t k = e + 1; k-- > 0;) {
+            int32_t id = byte_to_id_[query[k]];
+            if (id < 0) {
+                break;  // byte absent from corpus — no longer match ends here
+            }
+            auto pp = wm_.map2(static_cast<uint32_t>(id), lo, hi);
+            size_t base = c_[id] - first_[id];
+            size_t nlo = base + pp.first, nhi = base + pp.second;
+            if (nlo >= nhi) {
+                break;  // query[k..e] does not occur — stop extending
+            }
+            lo = nlo;
+            hi = nhi;
+            ++len;
+            if (len > best.length) {
+                best.length = len;
+                best.query_pos = k;
+                best.count = hi - lo;
+            }
+        }
+    }
+    return best;
+}
+
+std::vector<std::pair<uint8_t, size_t>>
+FMIndex::NextTokenCounts(const uint8_t* pattern, size_t plen) const {
+    std::vector<std::pair<uint8_t, size_t>> out;
+    if (c_.empty()) {
+        return out;
+    }
+    // No continuations if P itself does not occur.
+    auto pr = BackwardSearch(pattern, plen);
+    if (pr.first >= pr.second) {
+        return out;
+    }
+    // count(P·b) = number of occurrences of the (plen+1)-length string P then b.
+    std::vector<uint8_t> buf(pattern, pattern + plen);
+    buf.push_back(0);
+    for (int b = 0; b < 256; ++b) {
+        if (byte_to_id_[b] < 0) {
+            continue;  // byte never appears in the corpus
+        }
+        buf[plen] = static_cast<uint8_t>(b);
+        auto r = BackwardSearch(buf.data(), plen + 1);
+        size_t cnt = r.second - r.first;
+        if (cnt) {
+            out.emplace_back(static_cast<uint8_t>(b), cnt);
+        }
+    }
+    return out;
+}
+
 size_t
 FMIndex::LF(size_t i) const {
     uint32_t sym = wm_.access(i);
