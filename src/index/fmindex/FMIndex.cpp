@@ -27,8 +27,29 @@
 namespace milvus::index::fmindex {
 
 void
-FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate,
+FMIndex::Build(const std::vector<std::string_view>& docs, uint32_t sa_sample_rate,
                bool case_insensitive, bool force_wide) {
+    // Concatenate the documents into one internal buffer, injecting a '\0'
+    // separator after each. That separator is what makes every query
+    // document-scoped: no pattern free of '\0' can match a substring that
+    // straddles it, so cross-document matches simply do not exist in the index.
+    uint64_t internal_len = 0;
+    for (const auto& d : docs) {
+        internal_len += d.size() + 1;  // + separator
+    }
+    std::vector<uint8_t> buf;
+    buf.reserve(internal_len);
+    doc_start_.clear();
+    doc_start_.reserve(docs.size() + 1);
+    for (const auto& d : docs) {
+        doc_start_.push_back(buf.size());
+        buf.insert(buf.end(), d.begin(), d.end());
+        buf.push_back('\0');  // document separator
+    }
+    doc_start_.push_back(buf.size());  // end boundary (== internal_len)
+    const uint8_t* data = buf.data();
+    const size_t len = static_cast<size_t>(internal_len);
+
     // Suffix array is built with 32-bit indices under 2 GiB (compact) and 64-bit
     // indices at or above it (libsais64). Only the astronomically large 2^63
     // ceiling of the 64-bit path is a hard error.
@@ -42,7 +63,6 @@ FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate,
     // when forced (lets tests exercise the wide path on small inputs).
     wide_storage_ = force_wide || len >= (static_cast<size_t>(1) << 32);
     text_len_ = len;
-    doc_start_ = {0};  // default: whole corpus is one document
 
     // ASCII case fold: A-Z -> a-z when case_insensitive, identity otherwise.
     auto fold = [cf = case_fold_](uint8_t b) -> uint8_t {
@@ -119,6 +139,8 @@ FMIndex::Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate,
         bwt[i] = (v == 0) ? uint16_t{0}
                           : static_cast<uint16_t>(byte_to_id_[data[v - 1]]);
     }
+    std::vector<uint8_t>().swap(buf);  // internal text no longer needed
+    data = nullptr;
     FMIX_MEM("after BWT");
 
     // 4. C-table over sigma_ (cumulative counts can reach m, so 64-bit)
@@ -174,6 +196,7 @@ FMIndex::buildDerived() {
             id_to_byte_[byte_to_id_[b]] = static_cast<uint8_t>(b);
         }
     }
+    sep_id_ = byte_to_id_[0];  // dense id of the '\0' separator (-1 if none)
     // isa_sample_[k] = the BWT row whose suffix starts at text position k*rate.
     // Every multiple of rate in [0, text_len_] appears exactly once in the SA,
     // so this array is fully populated. Gives Extract an anchor within `rate`
@@ -189,11 +212,20 @@ FMIndex::buildDerived() {
 }
 
 std::string
-FMIndex::Extract(uint64_t pos, size_t len) const {
-    if (c_.empty() || pos >= text_len_) {
+FMIndex::Extract(uint64_t doc_id, uint64_t offset, size_t len) const {
+    if (c_.empty() || doc_id + 1 >= doc_start_.size()) {
+        return {};  // empty index or doc_id out of range
+    }
+    // Translate (doc, offset) to internal coordinates and clamp to the document's
+    // content end (the byte before its '\0'), so Extract never crosses into the
+    // separator or the next document.
+    uint64_t dstart = doc_start_[doc_id];
+    uint64_t dlen = doc_start_[doc_id + 1] - 1 - dstart;  // content length
+    if (offset >= dlen) {
         return {};
     }
-    uint64_t end = pos + std::min<uint64_t>(len, text_len_ - pos);
+    uint64_t pos = dstart + offset;
+    uint64_t end = pos + std::min<uint64_t>(len, dlen - offset);
     // Anchor: a row whose suffix starts at a sampled position >= end, then walk
     // backward (LF) collecting BWT chars, which are the text bytes before each
     // row's suffix. Prefer the nearest sample above `end`; fall back to row 0
@@ -234,8 +266,8 @@ FMIndex::LongestMatch(const uint8_t* query, size_t qlen) const {
         size_t lo = 0, hi = m, len = 0;
         for (size_t k = e + 1; k-- > 0;) {
             int32_t id = byte_to_id_[query[k]];
-            if (id < 0) {
-                break;  // byte absent from corpus — no longer match ends here
+            if (id < 0 || id == sep_id_) {
+                break;  // byte absent, or the separator — match cannot extend
             }
             auto pp = wm_.map2(static_cast<uint32_t>(id), lo, hi);
             size_t base = c_[id] - first_[id];
@@ -270,7 +302,7 @@ FMIndex::NextTokenCounts(const uint8_t* pattern, size_t plen) const {
     // count(P·b) = number of occurrences of the (plen+1)-length string P then b.
     std::vector<uint8_t> buf(pattern, pattern + plen);
     buf.push_back(0);
-    for (int b = 0; b < 256; ++b) {
+    for (int b = 1; b < 256; ++b) {  // skip b==0: the '\0' separator, not a real byte
         if (byte_to_id_[b] < 0) {
             continue;  // byte never appears in the corpus
         }
@@ -325,6 +357,9 @@ FMIndex::FuzzyMatchingDocs(const uint8_t* pat, size_t plen, uint32_t k) const {
             }
             visited[key] = e;
             int32_t tid = byte_to_id_[pat[i - 1]];
+            if (tid == sep_id_) {
+                tid = -1;  // a '\0' in the pattern never matches a real byte
+            }
             auto step = [&](uint32_t d, size_t& nlo, size_t& nhi) {
                 auto pp = wm_.map2(d, lo, hi);
                 size_t base = c_[d] - first_[d];
@@ -343,6 +378,9 @@ FMIndex::FuzzyMatchingDocs(const uint8_t* pat, size_t plen, uint32_t k) const {
             }
             dfs(lo, hi, i - 1, e + 1, mlen);  // deletion: skip pat[i-1], no text
             for (uint32_t d = 1; d < sigma_; ++d) {
+                if (static_cast<int32_t>(d) == sep_id_) {
+                    continue;  // never edit toward the separator (stays in-doc)
+                }
                 size_t nlo, nhi;
                 step(d, nlo, nhi);
                 if (nlo >= nhi) {
@@ -412,8 +450,8 @@ FMIndex::BackwardSearch(const uint8_t* pattern, size_t plen) const {
     size_t lo = 0, hi = m;
     for (size_t k = plen; k-- > 0;) {
         int32_t id = byte_to_id_[pattern[k]];
-        if (id < 0) {
-            return {0, 0};  // byte never appears in the corpus
+        if (id < 0 || id == sep_id_) {
+            return {0, 0};  // byte absent, or the '\0' separator (never queryable)
         }
         auto pp = wm_.map2(static_cast<uint32_t>(id), lo, hi);
         size_t base = c_[id] - first_[id];
@@ -469,7 +507,7 @@ FMIndex::CountBatch(
                     continue;
                 }
                 int32_t id = byte_to_id_[patterns[t0 + s].first[posn[s]]];
-                if (id < 0) {
+                if (id < 0 || id == sep_id_) {
                     active[s] = 0;
                     continue;
                 }
@@ -505,8 +543,14 @@ FMIndex::CountBatch(
     return result;
 }
 
+uint64_t
+FMIndex::docOf(uint64_t internal_pos) const {
+    auto it = std::upper_bound(doc_start_.begin(), doc_start_.end(), internal_pos);
+    return static_cast<uint64_t>(it - doc_start_.begin()) - 1;
+}
+
 std::vector<uint64_t>
-FMIndex::Locate(const uint8_t* pattern, size_t plen) const {
+FMIndex::locateInternal(const uint8_t* pattern, size_t plen) const {
     auto r = BackwardSearch(pattern, plen);
     std::vector<uint64_t> out;
     for (size_t i = r.first; i < r.second; ++i) {
@@ -518,31 +562,36 @@ FMIndex::Locate(const uint8_t* pattern, size_t plen) const {
         }
         uint64_t pos = sa_sample_vals_[sampled_bv_.rank1(row)] + steps;
         if (pos < text_len_) {
-            out.push_back(pos);
+            out.push_back(pos);  // internal coordinate (separators included)
         }
     }
     std::sort(out.begin(), out.end());
     return out;
 }
 
+std::vector<uint64_t>
+FMIndex::Locate(const uint8_t* pattern, size_t plen) const {
+    std::vector<uint64_t> pos = locateInternal(pattern, plen);
+    // Map to offsets in the separator-free concatenation: doc d's content is
+    // preceded by exactly d injected separators, so subtract d. The map is
+    // strictly monotone, so the result stays sorted.
+    for (uint64_t& p : pos) {
+        p -= docOf(p);
+    }
+    return pos;
+}
+
 std::vector<std::pair<uint64_t, uint64_t>>
 FMIndex::LocateDocs(const uint8_t* pattern, size_t plen) const {
-    std::vector<uint64_t> positions = Locate(pattern, plen);
+    std::vector<uint64_t> positions = locateInternal(pattern, plen);
     std::vector<std::pair<uint64_t, uint64_t>> out;
     out.reserve(positions.size());
     for (uint64_t pos : positions) {
-        auto it = std::upper_bound(doc_start_.begin(), doc_start_.end(), pos);
-        uint64_t doc_id = static_cast<uint64_t>(it - doc_start_.begin()) - 1;
-        uint64_t doc_end = (doc_id + 1 < doc_start_.size())
-                               ? doc_start_[doc_id + 1]
-                               : text_len_;
-        // Skip matches that spill past this document's end into the next one:
-        // documents are concatenated, so such an occurrence exists only in the
-        // raw buffer, not in any single document.
-        if (pos + plen > doc_end) {
-            continue;
-        }
-        out.emplace_back(doc_id, pos - doc_start_[doc_id]);
+        // No occurrence can span a document (the pattern holds no '\0'), so every
+        // hit is fully inside doc docOf(pos); the offset is measured from its
+        // internal start.
+        uint64_t doc = docOf(pos);
+        out.emplace_back(doc, pos - doc_start_[doc]);
     }
     std::sort(out.begin(), out.end());
     return out;
@@ -550,19 +599,16 @@ FMIndex::LocateDocs(const uint8_t* pattern, size_t plen) const {
 
 std::vector<uint64_t>
 FMIndex::LocatePrefixDocs(const uint8_t* pattern, size_t plen) const {
-    std::vector<uint64_t> positions = Locate(pattern, plen);
+    std::vector<uint64_t> positions = locateInternal(pattern, plen);
     std::vector<uint64_t> docs;
     for (uint64_t pos : positions) {
         // A document begins with the pattern iff the occurrence sits exactly on
-        // that document's start boundary AND fits within the document (a match
-        // that spills into the next document doesn't count as a prefix).
+        // a document's start boundary. It cannot spill past the document (no
+        // '\0' in the pattern), so no length check is needed.
         auto it = std::lower_bound(doc_start_.begin(), doc_start_.end(), pos);
         if (it != doc_start_.end() && *it == pos) {
             uint64_t doc_id = static_cast<uint64_t>(it - doc_start_.begin());
-            uint64_t doc_end = (doc_id + 1 < doc_start_.size())
-                                   ? doc_start_[doc_id + 1]
-                                   : text_len_;
-            if (pos + plen <= doc_end) {
+            if (doc_id + 1 < doc_start_.size()) {  // not the end sentinel
                 docs.push_back(doc_id);
             }
         }
@@ -574,18 +620,15 @@ FMIndex::LocatePrefixDocs(const uint8_t* pattern, size_t plen) const {
 
 std::vector<uint64_t>
 FMIndex::LocateSuffixDocs(const uint8_t* pattern, size_t plen) const {
-    std::vector<uint64_t> positions = Locate(pattern, plen);
+    std::vector<uint64_t> positions = locateInternal(pattern, plen);
     std::vector<uint64_t> docs;
     for (uint64_t pos : positions) {
-        // Find the document containing pos, then check the occurrence ends on
-        // that document's end boundary (next doc_start, or text_len for last).
-        auto it = std::upper_bound(doc_start_.begin(), doc_start_.end(), pos);
-        uint64_t doc_id = static_cast<uint64_t>(it - doc_start_.begin()) - 1;
-        uint64_t doc_end = (doc_id + 1 < doc_start_.size())
-                               ? doc_start_[doc_id + 1]
-                               : text_len_;
-        if (pos + plen == doc_end) {
-            docs.push_back(doc_id);
+        // A document ends with the pattern iff the occurrence ends exactly on
+        // that document's content end (the byte just before its '\0' separator).
+        uint64_t doc = docOf(pos);
+        uint64_t content_end = doc_start_[doc + 1] - 1;
+        if (pos + plen == content_end) {
+            docs.push_back(doc);
         }
     }
     std::sort(docs.begin(), docs.end());
@@ -616,7 +659,7 @@ get(const char*& p, const char* end) {
     return v;
 }
 constexpr uint32_t kMagic = 0x464D4958;  // "FMIX"
-constexpr uint32_t kFormatVersion = 5;
+constexpr uint32_t kFormatVersion = 6;  // v6: docs '\0'-separated, doc_start_ internal
 }  // namespace
 
 void

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include "index/fmindex/BitVector.h"
@@ -12,43 +13,52 @@
 
 namespace milvus::index::fmindex {
 
-// FM-index over a single concatenated byte buffer. Bytes are remapped to a
-// dense alphabet [1, sigma) (0 = sentinel), so the wavelet matrix uses only
-// ceil(log2(sigma)) levels — e.g. 3 for DNA, not a fixed 9. Exact substring
-// count / locate / (pk, offset) via BWT backward search; no false positives.
+// FM-index over a set of documents. You feed the documents already split; the
+// index concatenates them internally and injects a NUL ('\0') separator after
+// each one, so every query is inherently document-scoped (row semantics): a
+// pattern that contains no '\0' — all valid UTF-8 text qualifies — can never
+// match across a document boundary, because any cross-document substring would
+// have to straddle a separator. Bytes are remapped to a dense alphabet
+// [1, sigma) (0 = sentinel), so the wavelet matrix uses only ceil(log2(sigma))
+// levels. Exact substring count / locate / (doc, offset) via BWT backward
+// search; no false positives, and no matches spanning two documents.
 class FMIndex {
  public:
     FMIndex() = default;
 
-    // Build the index over one contiguous byte buffer (the concatenation of all
-    // your documents).
+    // Build the index over a set of documents. Document i (0-based, in the order
+    // given) is the unit every query result is attributed to and never crosses.
+    // The documents are concatenated internally with a '\0' separator after each,
+    // so results are inherently per-document; you own nothing but the split.
     //
-    //   data            pointer to the first byte of the buffer.
-    //   len             its length in BYTES (not documents, not characters;
-    //                   a UTF-8 CJK char counts as its 3 bytes). Must be
-    //                   < 2^31; for larger corpora, shard and build one index
-    //                   per shard. Count/Locate are exact over [data, data+len).
+    //   docs            the documents, in order. Contents MUST NOT contain a
+    //                   '\0' byte (that is the separator); valid UTF-8 never
+    //                   does. A UTF-8 CJK char counts as its 3 bytes. The total
+    //                   internal size (sum of doc sizes + one byte per doc) must
+    //                   be < 2^31 for the compact path, < 2^63 always; for larger
+    //                   corpora, shard and build one index per shard.
     //   sa_sample_rate  suffix-array sampling rate R (>= 1): store one SA value
     //                   every R text positions, recovering the rest via LF-
     //                   mapping. Pure space/locate trade-off, zero effect on
     //                   Count or correctness: larger R = smaller index but
     //                   slower Locate/LocateDocs (up to R-1 extra LF steps per
-    //                   hit); smaller R = faster Locate, larger sample array
-    //                   (~len/R * 4 bytes). Default 32 is balanced; use 4-8 if
-    //                   you Locate often, 64+ if you only ever Count.
+    //                   hit); smaller R = faster Locate, larger sample array.
+    //                   Default 32 is balanced; use 4-8 if you Locate often,
+    //                   64+ if you only ever Count.
     //   case_insensitive  when true, ASCII letters A-Z are folded to a-z at
     //                   build time (both cases share one symbol), so all queries
     //                   match case-insensitively with zero query-time cost. Only
     //                   ASCII case is folded; non-ASCII / UTF-8 bytes are left
-    //                   exact. Locate offsets still refer to the original text.
+    //                   exact. Extract still returns lowercase for folded letters.
     //   force_wide      normally the suffix array is built with 32-bit indices
-    //                   for len < 2 GiB (less memory) and 64-bit indices above;
-    //                   set true to force the 64-bit path regardless (used to
-    //                   exercise the wide path on small inputs in tests). The
-    //                   resulting index is identical either way.
+    //                   under 2 GiB (less memory) and 64-bit indices above; set
+    //                   true to force the 64-bit path regardless (to exercise the
+    //                   wide path on small inputs in tests). The index is
+    //                   identical either way.
     void
-    Build(const uint8_t* data, size_t len, uint32_t sa_sample_rate = 32,
-          bool case_insensitive = false, bool force_wide = false);
+    Build(const std::vector<std::string_view>& docs,
+          uint32_t sa_sample_rate = 32, bool case_insensitive = false,
+          bool force_wide = false);
 
     // Half-open SA interval [lo, hi) for pattern; lo==hi means no match.
     std::pair<size_t, size_t>
@@ -68,26 +78,22 @@ class FMIndex {
     CountBatch(const std::vector<std::pair<const uint8_t*, size_t>>& patterns)
         const;
 
+    // Sorted positions of every occurrence, expressed as offsets into the
+    // separator-free concatenation of the documents (i.e. with the injected
+    // '\0's removed). Occurrences never span a document. Mostly for parity /
+    // debugging — LocateDocs is the document-aware primitive.
     std::vector<uint64_t>
     Locate(const uint8_t* pattern, size_t plen) const;
 
-    // Document boundaries (offsets into the concatenated buffer), ascending and
-    // beginning with 0. If empty, the whole corpus is treated as one document.
-    void
-    SetDocStarts(std::vector<uint64_t> doc_start) {
-        doc_start_ = std::move(doc_start);
-        if (doc_start_.empty() || doc_start_[0] != 0) {
-            doc_start_.insert(doc_start_.begin(), 0);
-        }
-    }
-
+    // Sorted (doc_id, offset_within_doc) of every occurrence. Because documents
+    // are '\0'-separated internally, no occurrence can span two documents, so
+    // every hit is a genuine in-document match.
     std::vector<std::pair<uint64_t, uint64_t>>
     LocateDocs(const uint8_t* pattern, size_t plen) const;
 
     // Documents that BEGIN with the pattern (anchored prefix match), as sorted,
-    // unique document ids. A hit is an occurrence whose text position is exactly
-    // a document boundary. Requires SetDocStarts to be meaningful; with the
-    // default single document it reports {0} iff the whole corpus starts with P.
+    // unique document ids. A hit is an occurrence sitting exactly on a document's
+    // start boundary.
     std::vector<uint64_t>
     LocatePrefixDocs(const uint8_t* pattern, size_t plen) const;
     // Number of documents that begin with the pattern.
@@ -107,19 +113,23 @@ class FMIndex {
         return LocateSuffixDocs(pattern, plen).size();
     }
 
-    // Recover the original bytes T[pos, pos+len) from the index — e.g. to show
-    // the context around a match found via Locate. O(len + sa_sample_rate) LF
-    // steps; no forward navigation needed. If the index was built with
-    // case_insensitive=true, ASCII letters come back lowercased (original case
-    // is not stored). Returns fewer than len bytes if pos+len exceeds the text.
+    // Recover the original bytes of document `doc_id`, T[offset, offset+len)
+    // within that document — e.g. to show the context around a match from
+    // LocateDocs. Never crosses into another document (clamps to the document's
+    // end): returns fewer than len bytes if offset+len exceeds the document, and
+    // empty if doc_id is out of range. O(len + sa_sample_rate) LF steps. On a
+    // case_insensitive index, ASCII letters come back lowercased.
     std::string
-    Extract(uint64_t pos, size_t len) const;
+    Extract(uint64_t doc_id, uint64_t offset, size_t len) const;
 
     // The longest substring of `query` that occurs in the corpus (fuzzy / partial
     // contamination: "how long a span of this benchmark item appears in training",
     // which catches paraphrased or truncated overlaps that an exact n-gram misses).
-    // Returns the match length, its start offset in `query`, and how many times it
-    // occurs in the corpus. length == 0 means no single query byte occurs.
+    // Because the corpus is '\0'-separated, the reported span is always contained
+    // in a single document — i.e. the longest match found across all documents,
+    // never one stitched across a document boundary. Returns the match length,
+    // its start offset in `query`, and how many times it occurs in the corpus.
+    // length == 0 means no single query byte occurs.
     // O(qlen * match_length) — intended for query-sized inputs.
     struct LongestMatchResult {
         size_t length;      // length of the longest matching substring
@@ -131,25 +141,24 @@ class FMIndex {
 
     // Distribution of the byte that FOLLOWS context P: (byte, count) for every
     // byte b such that P·b occurs, sorted by byte. This turns the corpus into an
-    // n-gram model — P(next=b | P) = count_b / sum(counts). The sum can be less
-    // than Count(P): an occurrence of P at the very end of the corpus has no
-    // following byte. O(sigma * plen).
+    // n-gram model — P(next=b | P) = count_b / sum(counts). The '\0' separator is
+    // excluded, so an occurrence of P at the end of its document contributes no
+    // following byte; the sum can therefore be less than Count(P). O(sigma*plen).
     std::vector<std::pair<uint8_t, size_t>>
     NextTokenCounts(const uint8_t* pattern, size_t plen) const;
 
     // Sorted, unique document ids that contain `pat` (exact substring) — the
     // doc-granularity result a scalar filter needs (LIKE '%pat%'). Equivalent to
-    // the distinct doc ids of LocateDocs, i.e. cross-document seam matches are
-    // excluded.
+    // the distinct doc ids of LocateDocs.
     std::vector<uint64_t>
     MatchingDocs(const uint8_t* pat, size_t plen) const;
 
     // Sorted, unique document ids containing a substring within edit distance
     // <= k of `pat` (typo / variant tolerant: names, domains, codes). Also
-    // doc-granularity. Implemented by backtracking backward search, so cost
-    // grows fast with k and the alphabet — k is meant to be small (1-2) over
-    // short patterns. k == 0 is exactly MatchingDocs. Attribution is by the
-    // match's start position (a fuzzy match's length varies by +/-k).
+    // doc-granularity. Implemented by backtracking backward search that never
+    // steps through the '\0' separator, so a matched substring always lies inside
+    // one document. Cost grows fast with k and the alphabet — k is meant to be
+    // small (1-2) over short patterns. k == 0 is exactly MatchingDocs.
     std::vector<uint64_t>
     FuzzyMatchingDocs(const uint8_t* pat, size_t plen, uint32_t k) const;
 
@@ -211,6 +220,13 @@ class FMIndex {
  private:
     size_t
     LF(size_t i) const;
+    // SA positions (internal, separator-injected coordinates) of every
+    // occurrence, sorted. Shared by Locate / LocateDocs / prefix / suffix.
+    std::vector<uint64_t>
+    locateInternal(const uint8_t* pattern, size_t plen) const;
+    // Document id whose internal range contains internal position p.
+    uint64_t
+    docOf(uint64_t internal_pos) const;
     // Rebuild the in-RAM-only structures derived from the serialized fields:
     // id_to_byte_ (from byte_to_id_) and isa_sample_ (from sampled_bv_ +
     // sa_sample_vals_). Called after Build and after a load.
@@ -228,7 +244,7 @@ class FMIndex {
     uint32_t sa_sample_rate_ = 1;
     bool case_fold_ = false;             // ASCII A-Z folded to a-z at build time
     bool wide_storage_ = false;          // sampled-SA positions stored 8B (>=4GiB)
-    uint64_t text_len_ = 0;              // original byte count (no sentinel)
+    uint64_t text_len_ = 0;              // INTERNAL byte count incl. '\0' seps, no sentinel
     uint32_t sigma_ = 1;                 // dense alphabet size incl sentinel
     uint32_t qlevels_ = 0;              // ceil(ceil(log2(sigma_)) / 2)
     std::array<int32_t, 256> byte_to_id_{};  // byte -> dense id, -1 if absent
@@ -239,7 +255,12 @@ class FMIndex {
     // SA values of sampled rows, in row order. Held as uint64 in RAM; serialized
     // at 4 bytes when len < 2^32, else 8 (so small corpora keep the small index).
     std::vector<uint64_t> sa_sample_vals_;
-    std::vector<uint64_t> doc_start_;  // document boundaries
+    // Internal document boundaries (offsets into the separator-injected buffer),
+    // size n_docs+1: doc_start_[d] = internal start of doc d, doc_start_[n_docs]
+    // = text_len_. Doc d's content is [doc_start_[d], doc_start_[d+1]-1) with the
+    // '\0' at doc_start_[d+1]-1. sep_id_ is the dense id of that '\0'.
+    std::vector<uint64_t> doc_start_;
+    int32_t sep_id_ = -1;  // dense id of the '\0' separator (derived from byte_to_id_)
     // Derived, in-RAM only (rebuilt on load, never serialized):
     std::vector<uint8_t> id_to_byte_;    // dense id -> byte (inverse of byte_to_id_)
     std::vector<uint64_t> isa_sample_;   // isa_sample_[k] = row whose SA value = k*rate

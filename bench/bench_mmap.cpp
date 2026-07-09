@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "bench/corpus_gen.h"
@@ -56,7 +57,7 @@ main() {
     }
 
     FMIndex ram;
-    ram.Build(B(corpus), corpus.size(), 32);
+    ram.Build(std::vector<std::string_view>{corpus}, 32);
     std::string blob = ram.Serialize();
     printf("index blob = %.2f MB\n", blob.size() / (1024.0 * 1024.0));
 

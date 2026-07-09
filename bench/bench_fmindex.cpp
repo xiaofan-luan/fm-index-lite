@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "bench/corpus_gen.h"
@@ -53,7 +54,7 @@ main(int argc, char** argv) {
             for (uint32_t rate : sample_rates) {
                 FMIndex fm;
                 auto t0 = clk::now();
-                fm.Build(bytes(corpus), corpus.size(), rate);
+                fm.Build(std::vector<std::string_view>{corpus}, rate);
                 double build_ms = ms_since(t0);
 
                 std::string blob = fm.Serialize();
@@ -103,7 +104,7 @@ main(int argc, char** argv) {
             }
             // result dump for diffing (counts are sample-rate-independent)
             FMIndex fm;
-            fm.Build(bytes(corpus), corpus.size(), 32);
+            fm.Build(std::vector<std::string_view>{corpus}, 32);
             for (auto& q : queries) {
                 results << kname << '\t' << n << '\t'
                         << fm.Count(bytes(q), q.size()) << '\n';

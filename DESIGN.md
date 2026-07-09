@@ -11,20 +11,27 @@ Everything is translated clean-room from permissively-licensed sources
 
 ## 1. What it computes
 
-Given a byte buffer `T` of length `n` (the concatenation of many documents), the
-index answers, for any pattern `P`:
+The caller supplies documents already split (`std::vector<std::string_view>`). The
+build concatenates them into an internal buffer `T` of length `n`, injecting a `\0`
+**separator** after each document. Because no query pattern contains `\0` (all valid
+UTF-8 text qualifies), the separator guarantees that **no match can span a document
+boundary in any operation** — including `Count`. This makes results document-scoped
+(row semantics) with no per-query boundary filtering, and keeps `Count` O(1) in the
+match interval. For any pattern `P` the index answers:
 
-- `Count(P)` — number of occurrences of `P` in `T` (exact, no false positives).
-- `Locate(P)` — the sorted text positions of every occurrence.
+- `Count(P)` — number of (per-document) occurrences of `P` (exact, no false positives).
+- `Locate(P)` — sorted positions as offsets into the separator-free concatenation.
 - `LocateDocs(P)` — sorted `(doc_id, offset_within_doc)` of every occurrence.
+- `MatchingDocs(P)` / `FuzzyMatchingDocs(P, k)` — sorted, unique doc ids that contain
+  `P` exactly / within edit distance `k`.
 - `CountBatch({P_i})` — counts for many patterns at once, at much higher
   throughput (the bulk-decontamination path).
 - `LocatePrefixDocs(P)` / `LocateSuffixDocs(P)` — documents that begin / end with
   `P` (anchored match): occurrences that land on a document boundary, obtained by
-  filtering `Locate` against `doc_start` — no extra structure.
-- `Extract(pos, len)` — recover the original bytes `T[pos, pos+len)` from the index
-  (match context) in `O(len + sample_rate)` LF steps, using an inverse-sample anchor
-  (`isa_sample_`) — no forward navigation / `select` needed. See §4.
+  checking the occurrence's internal position against `doc_start` — no extra structure.
+- `Extract(doc_id, offset, len)` — recover the original bytes of a document (match
+  context) in `O(len + sample_rate)` LF steps, using an inverse-sample anchor
+  (`isa_sample_`), clamped to the document's end — no forward navigation / `select`. See §4.
 
 Matching is **byte-exact** by default. Build with `case_insensitive=true` to fold
 ASCII `A-Z→a-z` at build time (both cases share one dense-alphabet symbol, so
@@ -127,29 +134,47 @@ If `lo ≥ hi`, no match. After the last byte, **`hi − lo` is the occurrence c
 sentinel seat) are dropped. Sampling every `k`-th SA value trades index size for
 locate latency.
 
-**LocateDocs.** `upper_bound(doc_start, pos) − 1` gives the document; offset is
-`pos − doc_start[doc_id]`.
+`doc_start` here is the **internal** boundary array (offsets into the separator-
+injected buffer), size `n_docs+1` with a trailing end sentinel: document `d`'s
+content is `[doc_start[d], doc_start[d+1]−1)` and its `\0` sits at `doc_start[d+1]−1`.
+The separator is a dense-alphabet id (`sep_id_ = byte_to_id_['\0']`) that backward
+search rejects on entry, so a query never steps onto it — cross-document substrings
+therefore do not exist in the index and no boundary filtering is needed.
 
-**PrefixDocs / SuffixDocs.** `LocatePrefixDocs` keeps the `Locate` hits whose
-position is exactly a `doc_start` (the occurrence sits at a document's start);
-`LocateSuffixDocs` keeps those whose end `pos+plen` equals the document's end
-boundary. Both are pure filters over `Locate` — robust whether or not the pattern
-occurs elsewhere, and needing no extra structure.
+**Locate / LocateDocs.** `locateInternal` returns occurrence positions in internal
+coordinates; public `Locate` subtracts the document index (`internal_pos − docOf`)
+to give offsets into the separator-free concatenation. `LocateDocs` maps each to
+`(docOf(pos), pos − doc_start[doc])`. No spill check is needed — an occurrence can
+never cross a separator.
 
-**Extract.** To recover `T[pos, pos+len)` without keeping the source text, LF only
-walks *backward*, so we anchor at a sampled position `≥ pos+len` and walk down to
-`pos`, emitting `BWT[row] = wm.access(row)` (the byte before each row's suffix) via
-`id_to_byte_`. The anchor comes from `isa_sample_[k]` — the row whose SA value is
-`k·rate` — an inverse of the SA sampling built on load (in-RAM only, same size as
-`sa_sample_vals`). Cost is `O(len + rate)` LF steps; no `select`/ψ needed. On a
-case-folded index the recovered letters are lowercase (original case isn't stored).
+**PrefixDocs / SuffixDocs.** `LocatePrefixDocs` keeps hits whose internal position is
+exactly a `doc_start` (the occurrence sits at a document's start); `LocateSuffixDocs`
+keeps those whose end `pos+plen` equals the document's content end
+(`doc_start[doc+1]−1`).
+
+**Extract.** To recover a document's `T[offset, offset+len)` without keeping the
+source text, `(doc_id, offset)` is translated to an internal position and clamped to
+the document's content end. LF only walks *backward*, so we anchor at a sampled
+position `≥ end` and walk down, emitting `BWT[row] = wm.access(row)` (the byte before
+each row's suffix) via `id_to_byte_`. The anchor comes from `isa_sample_[k]` — the
+row whose SA value is `k·rate` — an inverse of the SA sampling built on load (in-RAM
+only). Cost is `O(len + rate)` LF steps; no `select`/ψ needed. On a case-folded index
+the recovered letters are lowercase (original case isn't stored).
+
+**MatchingDocs / FuzzyMatchingDocs.** `MatchingDocs` is the distinct doc ids of
+`LocateDocs`. `FuzzyMatchingDocs(P, k)` is a backtracking backward search — a DFS over
+SA intervals spending an error budget `k` on substitution / insertion / deletion,
+memoized on `(lo, hi, i)` — that skips the separator id, so every matched substring
+lies inside one document; it returns the sorted doc ids of the surviving intervals.
 
 **LongestMatch (fuzzy overlap).** For each end position `e` of the query, backward-
 search extends `query[k..e]` leftward while the SA interval stays non-empty; the run
 length when it collapses is the longest match ending at `e`. The global max over all
 `e` is the longest substring of the query present in the corpus — a partial-overlap
-signal for contamination that survives edits an exact n-gram would miss. `O(qlen ·
-match)`, meant for query-sized inputs; a bidirectional index would make it linear.
+signal for contamination that survives edits an exact n-gram would miss. The backward
+extension stops at the separator id, so the reported span is always contained in one
+document (the longest in-document match, never one stitched across a boundary).
+`O(qlen · match)`, meant for query-sized inputs; a bidirectional index would make it linear.
 
 **NextTokenCounts (n-gram model).** The next byte after context `P` is found by
 counting `P·b` for each corpus byte `b` — one backward search of the `|P|+1` string

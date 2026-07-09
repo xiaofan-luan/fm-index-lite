@@ -5,6 +5,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -26,6 +27,25 @@ using namespace milvus::index::fmindex;
 static const uint8_t*
 bytes(const std::string& s) {
     return reinterpret_cast<const uint8_t*>(s.data());
+}
+
+// Build a single-document index (the common case for the byte-level tests).
+static void
+build1(FMIndex& fm, const std::string& text, uint32_t rate = 32, bool ci = false,
+       bool fw = false) {
+    fm.Build(std::vector<std::string_view>{std::string_view(text)}, rate, ci, fw);
+}
+
+// Build a multi-document index from a list of documents.
+static void
+buildn(FMIndex& fm, const std::vector<std::string>& docs, uint32_t rate = 32,
+       bool ci = false, bool fw = false) {
+    std::vector<std::string_view> v;
+    v.reserve(docs.size());
+    for (const auto& d : docs) {
+        v.emplace_back(d);
+    }
+    fm.Build(v, rate, ci, fw);
 }
 
 // ---------- oracles ----------
@@ -188,8 +208,9 @@ TEST(SuffixArray, MatchesBruteForceRandom) {
 TEST(FMIndex, BuildInvariants) {
     std::string text = "banana";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 1);
-    CHECK_EQ(fm.bwt_size(), text.size() + 1);
+    build1(fm, text, 1);
+    // internal text is "banana" + one '\0' separator, so bwt_size == len + 2.
+    CHECK_EQ(fm.bwt_size(), text.size() + 2);
     CHECK_EQ(fm.c_at(0), 0u);
     for (uint32_t c = 1; c < fm.alphabet(); ++c) {
         CHECK(fm.c_at(c - 1) <= fm.c_at(c));
@@ -199,7 +220,7 @@ TEST(FMIndex, BuildInvariants) {
 TEST(FMIndex, CountMatchesBruteForce) {
     std::string text = "mississippi";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 1);
+    build1(fm, text, 1);
     for (std::string pat :
          {"i", "s", "ss", "issi", "ippi", "mississippi", "x", "ppi"}) {
         CHECK_EQ(fm.Count(bytes(pat), pat.size()), brute_count(text, pat));
@@ -209,7 +230,7 @@ TEST(FMIndex, CountMatchesBruteForce) {
 TEST(FMIndex, NoMatchReturnsZero) {
     std::string text = "abcabc";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 1);
+    build1(fm, text, 1);
     std::string pat = "abcd";
     CHECK_EQ(fm.Count(bytes(pat), pat.size()), 0u);
 }
@@ -218,7 +239,7 @@ TEST(FMIndex, LocateMatchesBruteForceAcrossSampleRates) {
     std::string text = "abracadabra_abracadabra";
     for (uint32_t rate : {1u, 2u, 3u, 8u, 32u}) {
         FMIndex fm;
-        fm.Build(bytes(text), text.size(), rate);
+        build1(fm, text, rate);
         for (std::string pat :
              {"a", "abra", "bra", "dab", "xyz", "abracadabra"}) {
             CHECK_EQ(fm.Locate(bytes(pat), pat.size()),
@@ -228,16 +249,8 @@ TEST(FMIndex, LocateMatchesBruteForceAcrossSampleRates) {
 }
 
 TEST(FMIndex, DocMappingLocatesPkAndOffset) {
-    std::vector<std::string> docs = {"cat", "banana", "cataract"};
-    std::string concat;
-    std::vector<uint64_t> starts;
-    for (auto& d : docs) {
-        starts.push_back(concat.size());
-        concat += d;
-    }
     FMIndex fm;
-    fm.Build(bytes(concat), concat.size(), 2);
-    fm.SetDocStarts(starts);
+    buildn(fm, {"cat", "banana", "cataract"}, 2);
 
     std::string pat = "cat";
     auto hits = fm.LocateDocs(bytes(pat), pat.size());
@@ -253,15 +266,8 @@ TEST(FMIndex, DocMappingLocatesPkAndOffset) {
 TEST(FMIndex, SerializeRoundTrip) {
     std::vector<std::string> docs = {"the quick brown fox", "the lazy dog",
                                      "quick quick"};
-    std::string concat;
-    std::vector<uint64_t> starts;
-    for (auto& d : docs) {
-        starts.push_back(concat.size());
-        concat += d;
-    }
     FMIndex fm;
-    fm.Build(bytes(concat), concat.size(), 4);
-    fm.SetDocStarts(starts);
+    buildn(fm, docs, 4);
 
     std::string blob = fm.Serialize();
     FMIndex fm2 = FMIndex::Deserialize(blob);
@@ -284,7 +290,7 @@ TEST(FMIndex, RandomizedFuzzVsBruteForce) {
         }
         uint32_t rate = 1 + rng() % 16;
         FMIndex fm;
-        fm.Build(bytes(text), text.size(), rate);
+        build1(fm, text, rate);
         for (int q = 0; q < 20; ++q) {
             size_t plen = 1 + rng() % 6;
             std::string pat(plen, 'a');
@@ -298,16 +304,14 @@ TEST(FMIndex, RandomizedFuzzVsBruteForce) {
 }
 
 TEST(FMIndex, UTF8AndBoundaryBytes) {
-    // Build explicitly: a string literal with an embedded \x00 would be
-    // truncated by std::string's const char* constructor.
+    // Multibyte UTF-8 plus boundary bytes 0xff / 0x01. NUL (0x00) is reserved as
+    // the document separator, so document contents never contain it.
     std::string text = "caf\xc3\xa9 \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e ";
     text.push_back('\xff');
-    text.push_back('\x00');
     text.push_back('\x01');
     text += "test";
-    text.push_back('\x00');
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 3);
+    build1(fm, text, 3);
     std::string pat = "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e";  // 日本語
     CHECK_EQ(fm.Count(bytes(pat), pat.size()), 1u);
     std::string pat2 = "test";
@@ -323,7 +327,7 @@ TEST(FMIndex, CountBatchMatchesPerQuery) {
             ch = 'a' + (rng() % 4);
         }
         FMIndex fm;
-        fm.Build(bytes(text), text.size(), 8);
+        build1(fm, text, 8);
         std::vector<std::string> pats;
         for (int q = 0; q < 40; ++q) {
             size_t plen = rng() % 6;  // includes empty pattern
@@ -348,7 +352,7 @@ TEST(FMIndex, CountBatchMatchesPerQuery) {
 TEST(FMIndex, DnaReadAlignment) {
     std::string ref = "ACGTTGCACGATTACAGGATCCACGTACGTTGCA";
     FMIndex fm;
-    fm.Build(bytes(ref), ref.size(), 4);
+    build1(fm, ref, 4);
     std::string read = "ACGT";
     auto pos = fm.Locate(bytes(read), read.size());
     CHECK_EQ(pos, brute_positions(ref, read));
@@ -427,7 +431,7 @@ TEST(WaveletMatrix4, AccessRankMap2Consistent) {
 // ---------- FMIndex edge cases ----------
 TEST(FMIndex, EmptyCorpus) {
     FMIndex fm;
-    fm.Build(bytes(std::string()), 0, 4);
+    fm.Build(std::vector<std::string_view>{}, 4);  // no documents at all
     CHECK_EQ(fm.Count(bytes(std::string("a")), 1), 0u);
     CHECK_EQ(fm.Count(bytes(std::string()), 0), 1u);  // empty matches 1 position
     CHECK_EQ(fm.Locate(bytes(std::string("a")), 1).size(), 0u);
@@ -439,7 +443,7 @@ TEST(FMIndex, EmptyCorpus) {
 TEST(FMIndex, SingleCharAndAllSame) {
     for (std::string text : {std::string("a"), std::string("aaaaaaaa")}) {
         FMIndex fm;
-        fm.Build(bytes(text), text.size(), 2);
+        build1(fm, text, 2);
         CHECK_EQ(fm.Count(bytes(std::string("a")), 1), text.size());
         CHECK_EQ(fm.Count(bytes(std::string("aa")), 2),
                  text.size() >= 2 ? text.size() - 1 : 0u);
@@ -449,18 +453,20 @@ TEST(FMIndex, SingleCharAndAllSame) {
 }
 
 TEST(FMIndex, FullByteAlphabetAndBinary) {
-    // every byte value 0..255 present, arbitrary binary (not UTF-8)
+    // Every byte value 1..255 present (0 is reserved as the separator, which the
+    // build injects), arbitrary binary content. alphabet == 255 content bytes +
+    // separator '\0' + sentinel == 257.
     std::mt19937 rng(2024);
     std::string text;
-    for (int i = 0; i < 256; ++i) {
+    for (int i = 1; i < 256; ++i) {
         text.push_back(static_cast<char>(i));
     }
     for (int i = 0; i < 4000; ++i) {
-        text.push_back(static_cast<char>(rng() & 0xff));
+        text.push_back(static_cast<char>(1 + (rng() % 255)));  // never 0
     }
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 8);
-    CHECK_EQ(fm.alphabet(), 257u);  // 256 bytes + sentinel
+    build1(fm, text, 8);
+    CHECK_EQ(fm.alphabet(), 257u);  // 255 bytes + separator + sentinel
     // check a handful of substrings against brute force
     std::mt19937 rng2(5);
     for (int q = 0; q < 50; ++q) {
@@ -476,7 +482,7 @@ TEST(FMIndex, FullByteAlphabetAndBinary) {
 TEST(FMIndex, PatternLongerThanText) {
     std::string text = "abc";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 1);
+    build1(fm, text, 1);
     CHECK_EQ(fm.Count(bytes(std::string("abcd")), 4), 0u);
     CHECK_EQ(fm.Count(bytes(std::string("abcabc")), 6), 0u);
 }
@@ -484,7 +490,7 @@ TEST(FMIndex, PatternLongerThanText) {
 TEST(FMIndex, CountBatchEdgeCases) {
     std::string text = "abracadabra";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 2);
+    build1(fm, text, 2);
     // empty list
     CHECK_EQ(fm.CountBatch({}).size(), 0u);
     // mix: normal, empty pattern, absent char, single
@@ -625,11 +631,11 @@ TEST(SuffixArray, PermutationAndTextbookCorpora) {
 }
 
 // ---------- robustness: bug-fix regressions ----------
-TEST(FMIndex, LocateDocsWithoutSetDocStarts) {
-    // default: whole corpus is one document starting at 0 (no underflow)
+TEST(FMIndex, LocateDocsSingleDoc) {
+    // one document starting at 0 (no underflow computing the doc id)
     std::string text = "abcabc";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 1);
+    build1(fm, text, 1);
     auto hits = fm.LocateDocs(bytes(std::string("abc")), 3);
     std::vector<std::pair<uint64_t, uint64_t>> expect = {{0, 0}, {0, 3}};
     CHECK_EQ(hits, expect);
@@ -643,7 +649,7 @@ TEST(FMIndex, DeserializeCorruptReturnsEmpty) {
     CHECK_EQ(FMIndex::Deserialize(std::string("xx")).bwt_size(), 1u);
     std::string text = "hello world";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 4);
+    build1(fm, text, 4);
     std::string blob = fm.Serialize();
     std::string truncated = blob.substr(0, blob.size() / 2);
     FMIndex bad = FMIndex::Deserialize(truncated);  // must not crash/OOB
@@ -657,7 +663,7 @@ TEST(FMIndex, DeserializeCorruptReturnsEmpty) {
 TEST(FMIndex, CountBatchAcrossTiles) {
     std::string text = "the quick brown fox jumps over the lazy dog the the";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 4);
+    build1(fm, text, 4);
     for (size_t B : {size_t(1), size_t(32), size_t(33), size_t(64),
                      size_t(65), size_t(100)}) {
         std::vector<std::string> pats;
@@ -681,18 +687,10 @@ TEST(FMIndex, CountBatchAcrossTiles) {
 
 // ---------- mmap / zero-copy load ----------
 TEST(FMIndex, LoadViewZeroCopyMatchesInRam) {
-    std::string text = "the quick brown fox the lazy dog the the quick fox";
     std::vector<std::string> docs = {"the quick brown fox", " the lazy dog",
                                      " the the quick fox"};
-    std::string concat;
-    std::vector<uint64_t> starts;
-    for (auto& d : docs) {
-        starts.push_back(concat.size());
-        concat += d;
-    }
     FMIndex fm;
-    fm.Build(bytes(concat), concat.size(), 4);
-    fm.SetDocStarts(starts);
+    buildn(fm, docs, 4);
     std::string blob = fm.Serialize();
 
     // LoadView requires 8-byte-aligned bytes; a uint64 buffer guarantees it.
@@ -719,7 +717,7 @@ TEST(FMIndex, MmapFileRoundTrip) {
     std::string text =
         "mmap the quick brown fox jumps over the lazy dog the the";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 4);
+    build1(fm, text, 4);
     std::string path = "/tmp/fmidx_mmap_test.fmix";
     CHECK(SaveToFile(fm, path));
     // streamed file bytes must be byte-identical to Serialize()
@@ -753,15 +751,8 @@ TEST(FMIndex, MmapFileRoundTrip) {
 TEST(FMIndex, PrefixDocsAnchored) {
     std::vector<std::string> docs = {"error: disk full", "warning: low mem",
                                      "error: timeout", "erratic value"};
-    std::string concat;
-    std::vector<uint64_t> starts;
-    for (auto& d : docs) {
-        starts.push_back(concat.size());
-        concat += d;
-    }
     FMIndex fm;
-    fm.Build(bytes(concat), concat.size(), 4);
-    fm.SetDocStarts(starts);
+    buildn(fm, docs, 4);
 
     // "error" begins docs 0 and 2 (not 3 "erratic", not 1).
     std::string p = "error";
@@ -781,17 +772,10 @@ TEST(FMIndex, PrefixDocsAnchored) {
 }
 
 TEST(FMIndex, SuffixDocsAnchored) {
-    std::vector<std::string> docs = {"path/to/a.log", "path/to/b.txt",
-                                     "c.log", "logistics"};
-    std::string concat;
-    std::vector<uint64_t> starts;
-    for (auto& d : docs) {
-        starts.push_back(concat.size());
-        concat += d;
-    }
+    std::vector<std::string> docs = {"path/to/a.log", "path/to/b.txt", "c.log",
+                                     "logistics"};
     FMIndex fm;
-    fm.Build(bytes(concat), concat.size(), 4);
-    fm.SetDocStarts(starts);
+    buildn(fm, docs, 4);
 
     // ".log" ends docs 0 and 2 (not "logistics").
     std::string p = ".log";
@@ -813,7 +797,7 @@ TEST(FMIndex, SuffixDocsAnchored) {
 TEST(FMIndex, CaseInsensitiveMatch) {
     std::string text = "The Quick BROWN fox; the quick brown FOX.";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 4, /*case_insensitive=*/true);
+    build1(fm, text, 4, /*ci=*/true);
     CHECK(fm.case_insensitive());
 
     // all case variants of "quick" find both occurrences.
@@ -834,7 +818,7 @@ TEST(FMIndex, CaseInsensitiveMatch) {
 
     // case-sensitive index does NOT fold.
     FMIndex cs;
-    cs.Build(bytes(text), text.size(), 4);
+    build1(cs, text, 4);
     CHECK(!cs.case_insensitive());
     CHECK_EQ(cs.Count(bytes("QUICK"), 5), size_t(0));
     CHECK_EQ(cs.Count(bytes("quick"), 5), size_t(1));
@@ -843,7 +827,7 @@ TEST(FMIndex, CaseInsensitiveMatch) {
 TEST(FMIndex, CaseInsensitiveSurvivesRoundTrip) {
     std::string text = "Hello WORLD hello world";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 4, /*case_insensitive=*/true);
+    build1(fm, text, 4, /*ci=*/true);
     std::string blob = fm.Serialize();
     FMIndex fm2 = FMIndex::Deserialize(blob);
     CHECK(fm2.case_insensitive());
@@ -860,39 +844,40 @@ TEST(FMIndex, ExtractMatchesOriginal) {
         for (auto& ch : text) ch = 'a' + (rng() % 6);  // small alphabet, repeats
         uint32_t rate = 1 + rng() % 20;
         FMIndex fm;
-        fm.Build(bytes(text), text.size(), rate);
-        // random windows, including edges and over-long lengths
+        build1(fm, text, rate);
+        // random windows within the single document, including edges/over-long
         for (int q = 0; q < 30; ++q) {
             uint64_t pos = rng() % n;
             size_t len = rng() % (n + 5);
-            std::string got = fm.Extract(pos, len);
+            std::string got = fm.Extract(0, pos, len);
             size_t want_len = std::min<size_t>(len, n - pos);
             CHECK_EQ(got, text.substr(pos, want_len));
         }
-        // whole-text extraction
-        CHECK_EQ(fm.Extract(0, n), text);
-        // out-of-range
-        CHECK(fm.Extract(n, 5).empty());
+        // whole-document extraction
+        CHECK_EQ(fm.Extract(0, 0, n), text);
+        // offset past end, and out-of-range document
+        CHECK(fm.Extract(0, n, 5).empty());
+        CHECK(fm.Extract(1, 0, 5).empty());
     }
 }
 
 TEST(FMIndex, ExtractContextAroundMatchAfterLoad) {
     std::string text = "the quick brown fox jumps over the lazy dog";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 4);
+    build1(fm, text, 4);
     std::string blob = fm.Serialize();
     FMIndex fm2 = FMIndex::Deserialize(blob);  // derived structs rebuilt on load
 
     for (std::string pat : {"quick", "fox", "the", "dog"}) {
-        auto pos = fm2.Locate(bytes(pat), pat.size());
-        CHECK(!pos.empty());
-        for (uint64_t p : pos) {
+        auto hits = fm2.LocateDocs(bytes(pat), pat.size());
+        CHECK(!hits.empty());
+        for (auto [doc, off] : hits) {
             // the extracted window at the match equals the pattern
-            CHECK_EQ(fm2.Extract(p, pat.size()), pat);
+            CHECK_EQ(fm2.Extract(doc, off, pat.size()), pat);
             // and a little context on each side matches the original text
-            uint64_t start = p >= 3 ? p - 3 : 0;
+            uint64_t start = off >= 3 ? off - 3 : 0;
             size_t clen = std::min<size_t>(pat.size() + 6, text.size() - start);
-            CHECK_EQ(fm2.Extract(start, clen), text.substr(start, clen));
+            CHECK_EQ(fm2.Extract(doc, start, clen), text.substr(start, clen));
         }
     }
 }
@@ -902,16 +887,16 @@ TEST(FMIndex, ConcurrentQueriesMatchSingleThreaded) {
     // thread's answers equal the single-threaded ground truth (verifies the
     // const/lock-free query claim: no data races, no shared mutable state).
     std::mt19937 rng(7);
-    std::string text;
-    std::vector<uint64_t> starts;
+    std::vector<std::string> docs;
     for (int d = 0; d < 400; ++d) {
-        starts.push_back(text.size());
+        std::string doc;
         size_t dl = 5 + rng() % 40;
-        for (size_t i = 0; i < dl; ++i) text += char('a' + rng() % 8);
+        for (size_t i = 0; i < dl; ++i) doc += char('a' + rng() % 8);
+        docs.push_back(doc);
     }
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 8);
-    fm.SetDocStarts(starts);
+    buildn(fm, docs, 8);
+    const size_t nd = docs.size();
 
     std::vector<std::string> pats;
     for (int i = 0; i < 64; ++i) {
@@ -927,7 +912,7 @@ TEST(FMIndex, ConcurrentQueriesMatchSingleThreaded) {
     for (size_t i = 0; i < pats.size(); ++i) {
         truth_count[i] = fm.Count(bytes(pats[i]), pats[i].size());
         truth_loc[i] = fm.Locate(bytes(pats[i]), pats[i].size());
-        truth_ex[i] = fm.Extract(i * 3 % text.size(), 10);
+        truth_ex[i] = fm.Extract(i % nd, 0, 10);
     }
 
     const int kThreads = 8;
@@ -942,7 +927,7 @@ TEST(FMIndex, ConcurrentQueriesMatchSingleThreaded) {
                     mismatches++;
                 if (fm.Locate(bytes(pats[i]), pats[i].size()) != truth_loc[i])
                     mismatches++;
-                if (fm.Extract(i * 3 % text.size(), 10) != truth_ex[i])
+                if (fm.Extract(i % nd, 0, 10) != truth_ex[i])
                     mismatches++;
             }
         });
@@ -951,41 +936,111 @@ TEST(FMIndex, ConcurrentQueriesMatchSingleThreaded) {
     CHECK_EQ(mismatches.load(), 0);
 }
 
-TEST(FMIndex, NoCrossDocumentFalsePositives) {
-    // Documents are concatenated with only doc_start boundaries; a pattern that
-    // straddles a document seam occurs in the raw buffer but in NO document.
-    std::vector<std::string> docs = {"ab", "cd", "ef"};
-    std::string concat;
-    std::vector<uint64_t> starts;
-    for (auto& d : docs) { starts.push_back(concat.size()); concat += d; }
+TEST(FMIndex, NoCrossDocumentMatches) {
+    // Documents are '\0'-separated internally, so a pattern that would straddle
+    // a document seam does not occur AT ALL — not even raw Count sees it.
     FMIndex fm;
-    fm.Build(bytes(concat), concat.size(), 1);
-    fm.SetDocStarts(starts);
+    buildn(fm, {"ab", "cd", "ef"}, 1);
 
-    // "bc" spans the ab|cd seam: raw Count sees it, but it belongs to no doc.
-    CHECK_EQ(fm.Count(bytes("bc"), 2), size_t(1));          // raw concat
-    CHECK(fm.LocateDocs(bytes("bc"), 2).empty());           // no document
-    CHECK(fm.LocatePrefixDocs(bytes("bc"), 2).empty());
+    // "bc" would span the ab|cd seam: it simply does not exist in the index.
+    CHECK_EQ(fm.Count(bytes("bc"), 2), size_t(0));
+    CHECK(fm.Locate(bytes("bc"), 2).empty());
+    CHECK(fm.LocateDocs(bytes("bc"), 2).empty());
+    CHECK(fm.MatchingDocs(bytes("bc"), 2).empty());
 
-    // "dcd"? no. A genuine within-doc match still works.
-    auto hits = fm.LocateDocs(bytes("cd"), 2);
-    std::vector<std::pair<uint64_t, uint64_t>> expect = {{1, 0}};
-    CHECK_EQ(hits, expect);
-    // "abc" starts at doc 0 but spills into doc 1 -> not a prefix of doc 0.
-    CHECK_EQ(fm.Count(bytes("abc"), 3), size_t(1));
+    // "abc" would spill doc 0 into doc 1: also absent.
+    CHECK_EQ(fm.Count(bytes("abc"), 3), size_t(0));
     CHECK(fm.LocatePrefixDocs(bytes("abc"), 3).empty());
-    // but "ab" is a real prefix (and full) of doc 0.
+
+    // genuine within-document matches still work.
+    std::vector<std::pair<uint64_t, uint64_t>> cd = {{1, 0}};
+    CHECK_EQ(fm.LocateDocs(bytes("cd"), 2), cd);
     std::vector<uint64_t> pfx = {0};
     CHECK_EQ(fm.LocatePrefixDocs(bytes("ab"), 2), pfx);
+    std::vector<uint64_t> md = {2};
+    CHECK_EQ(fm.MatchingDocs(bytes("ef"), 2), md);
+}
+
+TEST(FMIndex, DocScopedFuzzVsPerDocOracle) {
+    // Count / LocateDocs / MatchingDocs over random documents must equal a naive
+    // per-document oracle — a cross-seam occurrence never exists, so Count is
+    // exactly the sum of in-document occurrences.
+    std::mt19937 rng(20260709);
+    for (int trial = 0; trial < 60; ++trial) {
+        int nd = 1 + rng() % 12;
+        std::vector<std::string> docs(nd);
+        for (auto& d : docs) {
+            size_t dl = rng() % 12;  // some empty documents too
+            for (size_t i = 0; i < dl; ++i) d += char('a' + rng() % 3);
+        }
+        FMIndex fm;
+        buildn(fm, docs, 1 + rng() % 8);
+        for (int q = 0; q < 15; ++q) {
+            size_t pl = 1 + rng() % 4;
+            std::string p;
+            for (size_t j = 0; j < pl; ++j) p += char('a' + rng() % 4);
+            size_t want_count = 0;
+            std::vector<std::pair<uint64_t, uint64_t>> want_ld;
+            std::vector<uint64_t> want_md;
+            for (size_t d = 0; d < docs.size(); ++d) {
+                auto occ = brute_positions(docs[d], p);
+                for (uint64_t pos : occ) {
+                    want_count++;
+                    want_ld.emplace_back(d, pos);
+                }
+                if (!occ.empty()) want_md.push_back(d);
+            }
+            std::sort(want_ld.begin(), want_ld.end());
+            CHECK_EQ(fm.Count(bytes(p), p.size()), want_count);
+            CHECK_EQ(fm.LocateDocs(bytes(p), p.size()), want_ld);
+            CHECK_EQ(fm.MatchingDocs(bytes(p), p.size()), want_md);
+        }
+    }
+}
+
+TEST(FMIndex, LongestMatchStaysInDocument) {
+    // "abc" | "XYZ": the query "abcXYZ" would match length 6 across the seam in a
+    // naive concatenation, but each document only offers length 3.
+    FMIndex fm;
+    buildn(fm, {"abc", "XYZ"}, 1);
+    std::string q = "abcXYZ";
+    auto r = fm.LongestMatch(bytes(q), q.size());
+    CHECK_EQ(r.length, size_t(3));  // never the 6-long cross-seam span
+    CHECK_EQ(r.count, size_t(1));
+}
+
+TEST(FMIndex, ExtractStaysInDocument) {
+    std::vector<std::string> docs = {"hello", "world!!", "x"};
+    FMIndex fm;
+    buildn(fm, docs, 2);
+    for (size_t d = 0; d < docs.size(); ++d) {
+        CHECK_EQ(fm.Extract(d, 0, docs[d].size()), docs[d]);       // whole doc
+        CHECK_EQ(fm.Extract(d, 0, docs[d].size() + 10), docs[d]);  // clamped
+        if (!docs[d].empty())
+            CHECK_EQ(fm.Extract(d, 1, 100), docs[d].substr(1));    // mid to end
+    }
+    CHECK(fm.Extract(docs.size(), 0, 5).empty());     // out-of-range document
+    CHECK(fm.Extract(0, docs[0].size(), 5).empty());  // offset past end
+}
+
+TEST(FMIndex, NextTokenCountsExcludesSeparator) {
+    // "ab" ends doc 0 (follower is the separator, which must NOT be reported) and
+    // in doc 1 "ab" is followed by 'c'.
+    FMIndex fm;
+    buildn(fm, {"ab", "abc"}, 1);
+    auto got = fm.NextTokenCounts(bytes("ab"), 2);
+    std::vector<std::pair<uint8_t, size_t>> want = {{'c', 1}};
+    CHECK_EQ(got, want);
+    for (auto& [b, c] : got) CHECK(b != 0);  // separator never appears
 }
 
 TEST(FMIndex, DeserializeRejectsCorruptByteMap) {
     std::string text = "banana";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 4);
+    build1(fm, text, 4);
     std::string blob = fm.Serialize();
 
-    // Header layout: magic,ver,rate,sigma,qlevels,casefold (6*uint32=24) then
+    // Header layout: magic,ver,rate,sigma,qlevels,flags (6*uint32=24) then
     // text_len (uint64) => byte_to_id_ starts at offset 32, entry b at 32+4b.
     // Point byte 'z' (normally -1, absent) at a bogus id well past sigma_.
     int32_t bogus = 100;
@@ -1003,7 +1058,7 @@ TEST(FMIndex, DeserializeRejectsCorruptByteMap) {
 TEST(FMIndex, MappedOpenFailsOnCorruptFile) {
     std::string text = "the quick brown fox";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 4);
+    build1(fm, text, 4);
     std::string path = "/tmp/fmix_corrupt_test.fmix";
     CHECK(SaveToFile(fm, path));
 
@@ -1046,20 +1101,16 @@ TEST(FMIndex, WideAndNarrowBuildsAgree) {
     // force_wide builds the 64-bit SA path (and 8-byte position storage) on
     // small inputs; it must produce identical query results to the 32-bit path.
     std::mt19937 rng(31);
-    std::string text;
-    std::vector<uint64_t> starts;
+    std::vector<std::string> docs;
     for (int d = 0; d < 200; ++d) {
-        starts.push_back(text.size());
+        std::string doc;
         size_t dl = 3 + rng() % 30;
-        for (size_t i = 0; i < dl; ++i) text += char('a' + rng() % 6);
+        for (size_t i = 0; i < dl; ++i) doc += char('a' + rng() % 6);
+        docs.push_back(doc);
     }
     FMIndex narrow, wide;
-    narrow.Build(bytes(text), text.size(), 8, /*case_insensitive=*/false,
-                 /*force_wide=*/false);
-    wide.Build(bytes(text), text.size(), 8, /*case_insensitive=*/false,
-               /*force_wide=*/true);
-    narrow.SetDocStarts(starts);
-    wide.SetDocStarts(starts);
+    buildn(narrow, docs, 8, /*ci=*/false, /*fw=*/false);
+    buildn(wide, docs, 8, /*ci=*/false, /*fw=*/true);
     CHECK(!narrow.wide());
     CHECK(wide.wide());
 
@@ -1075,15 +1126,14 @@ TEST(FMIndex, WideAndNarrowBuildsAgree) {
                  wide.LocateDocs(bytes(p), p.size()));
     }
     // Extract agrees too.
-    CHECK_EQ(narrow.Extract(0, 50), wide.Extract(0, 50));
+    CHECK_EQ(narrow.Extract(0, 0, 50), wide.Extract(0, 0, 50));
 }
 
 TEST(FMIndex, WideStorageSurvivesRoundTrip) {
     // Exercises the 8-byte sampled-SA serialization path on small data.
     std::string text = "the quick brown fox jumps over the lazy dog again";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 4, /*case_insensitive=*/false,
-             /*force_wide=*/true);
+    build1(fm, text, 4, /*ci=*/false, /*fw=*/true);
     CHECK(fm.wide());
     std::string blob = fm.Serialize();
     FMIndex fm2 = FMIndex::Deserialize(blob);
@@ -1100,7 +1150,7 @@ TEST(FMIndex, WideStorageSurvivesRoundTrip) {
 TEST(FMIndex, MegabyteScaleVsNaiveOracle) {
     // Correctness at a scale the tiny fuzz tests don't reach (~1 MB), against an
     // independent naive std::string::find oracle, exercising BOTH the 32-bit and
-    // 64-bit (force_wide) build paths on the same data.
+    // 64-bit (force_wide) build paths on the same single-document data.
     std::mt19937 rng(4242);
     const size_t N = 1u << 20;  // 1 MiB
     std::string text(N, 'a');
@@ -1112,8 +1162,8 @@ TEST(FMIndex, MegabyteScaleVsNaiveOracle) {
             text.replace(rng() % (N - 16), strlen(nd), nd);
 
     FMIndex narrow, wide;
-    narrow.Build(bytes(text), text.size(), 16);
-    wide.Build(bytes(text), text.size(), 16, false, /*force_wide=*/true);
+    build1(narrow, text, 16);
+    build1(wide, text, 16, /*ci=*/false, /*fw=*/true);
 
     auto naive_count = [&](const std::string& p) {
         size_t c = 0, pos = 0;
@@ -1164,15 +1214,15 @@ TEST(FMIndex, MegabyteScaleVsNaiveOracle) {
         uint64_t pos = rng() % N;
         size_t len = rng() % 64;
         std::string want = text.substr(pos, std::min<size_t>(len, N - pos));
-        CHECK_EQ(narrow.Extract(pos, len), want);
-        CHECK_EQ(wide.Extract(pos, len), want);
+        CHECK_EQ(narrow.Extract(0, pos, len), want);
+        CHECK_EQ(wide.Extract(0, pos, len), want);
     }
 }
 
 TEST(FMIndex, LongestMatchVsOracle) {
     std::string text = "the quick brown fox jumps over the lazy dog";
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 4);
+    build1(fm, text, 4);
 
     auto naive_count = [&](const std::string& p) {
         if (p.empty()) return size_t(0);
@@ -1211,7 +1261,7 @@ TEST(FMIndex, LongestMatchVsOracle) {
 TEST(FMIndex, NextTokenCountsVsOracle) {
     std::string text = "abcabdabxabc";  // "ab" -> c,d,x,c ; "abc" -> (end?) etc.
     FMIndex fm;
-    fm.Build(bytes(text), text.size(), 4);
+    build1(fm, text, 4);
 
     auto check = [&](const std::string& ctx) {
         // oracle: scan text for ctx, tally the following byte
@@ -1320,12 +1370,8 @@ TEST(FMIndex, MatchingDocsAndFuzzyVsOracle) {
     std::vector<std::string> docs = {"paypal login here", "paypa1 secure page",
                                      "visit the paypall site", "unrelated content",
                                      "pay pal support",       "totally different"};
-    std::string concat;
-    std::vector<uint64_t> starts;
-    for (auto& d : docs) { starts.push_back(concat.size()); concat += d; }
     FMIndex fm;
-    fm.Build(bytes(concat), concat.size(), 4);
-    fm.SetDocStarts(starts);
+    buildn(fm, docs, 4);
 
     // exact: MatchingDocs == docs whose text contains P as a substring
     auto exact_oracle = [&](const std::string& p) {
@@ -1360,7 +1406,6 @@ TEST(FMIndex, MatchingDocsAndFuzzyVsOracle) {
 
     for (std::string p : {"paypal", "secure", "pal", "xyz", "different"}) {
         CHECK_EQ(fm.MatchingDocs(bytes(p), p.size()), exact_oracle(p));
-        // k == 0 fuzzy equals the by-start exact oracle
         CHECK_EQ(fm.FuzzyMatchingDocs(bytes(p), p.size(), 0), fuzzy_oracle(p, 0));
         for (uint32_t k = 1; k <= 2; ++k)
             CHECK_EQ(fm.FuzzyMatchingDocs(bytes(p), p.size(), k),
@@ -1369,23 +1414,19 @@ TEST(FMIndex, MatchingDocsAndFuzzyVsOracle) {
 
     // randomized: small alphabet so edits actually land on real substrings
     std::mt19937 rng(909);
-    std::string text;
-    std::vector<uint64_t> rstarts;
+    std::vector<std::string> rdocs;
     for (int d = 0; d < 30; ++d) {
-        rstarts.push_back(text.size());
+        std::string doc;
         size_t dl = 5 + rng() % 15;
-        for (size_t i = 0; i < dl; ++i) text += char('a' + rng() % 4);
+        for (size_t i = 0; i < dl; ++i) doc += char('a' + rng() % 4);
+        rdocs.push_back(doc);
     }
     FMIndex rfm;
-    rfm.Build(bytes(text), text.size(), 4);
-    rfm.SetDocStarts(rstarts);
+    buildn(rfm, rdocs, 4);
     auto rfuzzy = [&](const std::string& p, uint32_t k) {
         std::vector<uint64_t> ds;
-        for (size_t d = 0; d < rstarts.size(); ++d) {
-            size_t s = rstarts[d];
-            size_t e = (d + 1 < rstarts.size()) ? rstarts[d + 1] : text.size();
-            if (approx_in(p, text.substr(s, e - s), k)) ds.push_back(d);
-        }
+        for (size_t d = 0; d < rdocs.size(); ++d)
+            if (approx_in(p, rdocs[d], k)) ds.push_back(d);
         return ds;
     };
     for (int q = 0; q < 60; ++q) {

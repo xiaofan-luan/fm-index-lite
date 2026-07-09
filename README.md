@@ -25,40 +25,39 @@ count, and locate — up to several× on batched count — at equal index size. 
 
 ## Modeling your business data
 
-The index works over **one contiguous byte buffer** — the concatenation of all
-your documents — plus the **document boundaries**, so every match maps back to the
-document it came from.
+You feed the index your documents **already split** — a list of byte strings. It
+concatenates them internally and injects a `\0` separator after each, so every
+result is **document-scoped (row semantics)**: no query can ever match across a
+document boundary.
 
 ```
 docs = [ "doc A text...", "doc B text...", "doc C text..." ]
 
-concat      = "doc A text...doc B text...doc C text..."
-doc_start   = [ 0,           13,           26 ]   // byte offset where each doc begins
+internal = "doc A text...\0doc B text...\0doc C text...\0"   // separators injected for you
 ```
 
-- A "document" is whatever unit you want results attributed to and to remove/act
-  on — a training document, a log line, a paragraph, a chunk, a DNA read.
-- `doc_start[i]` is the byte offset where document `i` begins in `concat` (sorted,
-  starts at 0). Pass it via `SetDocStarts`; then `LocateDocs` returns
-  `(doc_id, offset_within_doc)` for every hit. If you don't set it, the whole
-  buffer is treated as one document.
-- Bytes are arbitrary — UTF-8 text, raw logs, `{A,C,G,T}`, anything. Matching is
-  byte-exact and case-sensitive.
+- A "document" is whatever unit you want results attributed to and to act on — a
+  training document, a table row, a log line, a paragraph, a chunk, a DNA read.
+  Document `i` (0-based, in the order you pass) is what every result maps back to.
+- **You own nothing but the split.** `LocateDocs` returns `(doc_id,
+  offset_within_doc)`; `MatchingDocs`/`FuzzyMatchingDocs` return doc ids; `Extract`
+  takes `(doc_id, offset, len)`. No global offsets to manage.
+- **Contents must not contain `\0`** — that byte is the separator. All valid UTF-8
+  text qualifies (UTF-8 never encodes a NUL except for U+0000 itself). Everything
+  else is arbitrary bytes — raw logs, `{A,C,G,T}`, binary. Matching is byte-exact
+  (optionally ASCII-case-insensitive).
+- **No cross-document matches — ever, in any operation.** Because a pattern free of
+  `\0` cannot span a separator, a substring that would straddle two documents (e.g.
+  docs `"ab"`,`"cd"` — `"bc"`) simply does not exist in the index. This holds for
+  *every* primitive, `Count` included — not just the document-attributed ones — so
+  `Count` is per-document exact **and** still O(1) in the match interval.
 - One index handles corpora up to **2^63 bytes**: the suffix array is built with
   32-bit indices under 2 GiB (compact, less build memory) and 64-bit indices at or
-  above it — chosen automatically from `len`. Sampled positions likewise serialize
-  4 bytes wide under 4 GiB, 8 above, so a small corpus keeps a small index. Going
-  past 2 GiB in one index is mostly limited by **build memory** (~12× the corpus),
-  so for large data prefer one index per shard/segment (this is how it plugs into
-  Milvus, one index per sealed segment).
-- **Document boundaries are respected on attribution.** Because documents are
-  concatenated, a pattern can straddle a seam (e.g. docs `"ab"`,`"cd"` — `"bc"`
-  exists in the buffer but in no document). Raw `Count`/`Locate` work over the
-  concatenated buffer and *do* see such matches; the document-attributed queries
-  (`LocateDocs`, `LocatePrefixDocs`, `LocateSuffixDocs`) **exclude** them, so they
-  never report a match that no single document contains. If you need `Count`
-  itself to be per-document exact, separate documents with a byte your queries
-  never use.
+  above it — chosen automatically. Sampled positions likewise serialize 4 bytes
+  wide under 4 GiB, 8 above, so a small corpus keeps a small index. Going past
+  2 GiB in one index is mostly limited by **build memory** (~8× the corpus), so for
+  large data prefer one index per shard/segment (this is how it plugs into Milvus,
+  one index per sealed segment).
 
 ## Quick start
 
@@ -66,45 +65,40 @@ doc_start   = [ 0,           13,           26 ]   // byte offset where each doc 
 #include "index/fmindex/FMIndex.h"
 using namespace milvus::index::fmindex;
 
-// 1. concatenate your documents and record their offsets
-std::string concat;
-std::vector<uint64_t> doc_start;
-for (const std::string& d : docs) { doc_start.push_back(concat.size()); concat += d; }
-
-// 2. build
-//    Build(data, len, sa_sample_rate = 32)
-//      data           first byte of the concatenated buffer
-//      len            its length in BYTES (< 2^31; shard larger corpora)
+// 1. build straight from your split documents — the index concatenates them and
+//    injects the '\0' separators for you.
+//    Build(docs, sa_sample_rate = 32, case_insensitive = false)
+//      docs           your documents, in order (document i gets doc id i);
+//                     contents must not contain '\0'
 //      sa_sample_rate SA sampling rate: space/locate trade-off, no effect on
 //                     Count — default 32 is balanced; 4-8 = faster Locate,
 //                     bigger index; 64+ = smaller index if you only Count
+std::vector<std::string_view> docs = { "doc A text...", "doc B text...", ... };
 FMIndex fm;
-fm.Build(reinterpret_cast<const uint8_t*>(concat.data()), concat.size());  // sa_sample_rate defaults to 32
-fm.SetDocStarts(doc_start);
+fm.Build(docs);                        // sa_sample_rate defaults to 32
 
-// 3. query
-auto n   = fm.Count (P, plen);         // how many times P occurs
-auto pos = fm.Locate(P, plen);         // sorted text positions
-auto hit = fm.LocateDocs(P, plen);     // sorted {doc_id, offset} per occurrence
+// 2. query — everything is per-document
+auto n    = fm.Count(P, plen);         // per-document exact occurrence count
+auto hit  = fm.LocateDocs(P, plen);    // sorted {doc_id, offset} per occurrence
+auto ids  = fm.MatchingDocs(P, plen);  // sorted doc ids containing P (LIKE '%P%')
 ```
 
 ## Workflow: decontamination (the primary use case)
 
 ```cpp
-// index the training corpus once
+// index the training corpus once — one document per training example
 FMIndex fm;
-fm.Build(corpus_ptr, corpus_len, 32);
-fm.SetDocStarts(doc_start);
+fm.Build(training_docs);  // std::vector<std::string_view>
 
 // extract n-grams (e.g. 13-grams) from every benchmark item, then score them all
 // at once — batched is far faster than one-by-one (see below)
 std::vector<std::pair<const uint8_t*, size_t>> ngrams = extract_ngrams(benchmarks);
 std::vector<size_t> counts = fm.CountBatch(ngrams);
 
-// any n-gram with count > 0 is a leak; LocateDocs tells you which documents to drop
+// any n-gram with count > 0 is a leak; MatchingDocs tells you which documents to drop
 for (size_t i = 0; i < ngrams.size(); ++i)
     if (counts[i] > 0)
-        for (auto [doc_id, off] : fm.LocateDocs(ngrams[i].first, ngrams[i].second))
+        for (uint64_t doc_id : fm.MatchingDocs(ngrams[i].first, ngrams[i].second))
             contaminated_docs.insert(doc_id);
 ```
 
@@ -117,26 +111,25 @@ calling `Count` in a loop. It is the right primitive for decontamination
 
 | Call | Returns |
 |---|---|
-| `Build(data, len, sa_sample_rate=32, case_insensitive=false)` | build the index over a byte buffer |
-| `SetDocStarts(offsets)` | document boundaries (optional; default = one doc) |
-| `Count(pat, len)` | exact occurrence count |
+| `Build(docs, sa_sample_rate=32, case_insensitive=false)` | build over a list of documents (`std::vector<std::string_view>`) |
+| `Count(pat, len)` | per-document exact occurrence count |
 | `CountBatch(patterns)` | counts for many patterns, high throughput |
-| `Locate(pat, len)` | sorted text positions of every occurrence |
-| `LocateDocs(pat, len)` | sorted `(doc_id, offset)` of every occurrence |
+| `Locate(pat, len)` | sorted positions (separator-free global offsets) |
+| `LocateDocs(pat, len)` | sorted `(doc_id, offset_within_doc)` of every occurrence |
 | `MatchingDocs(pat, len)` | sorted, unique **doc ids** containing `pat` (exact `LIKE '%pat%'`) |
 | `FuzzyMatchingDocs(pat, len, k)` | sorted, unique **doc ids** containing a substring within **edit distance ≤ k** of `pat` |
 | `LocatePrefixDocs(pat, len)` / `CountPrefixDocs` | documents that **begin** with `pat` |
 | `LocateSuffixDocs(pat, len)` / `CountSuffixDocs` | documents that **end** with `pat` |
-| `Extract(pos, len)` | recover the original bytes `T[pos, pos+len)` (match context) |
+| `Extract(doc_id, offset, len)` | recover the original bytes of a document (match context) |
 | `LongestMatch(query, qlen)` | longest substring of `query` present in the corpus (fuzzy overlap) |
 | `NextTokenCounts(pat, len)` | distribution of the byte following `pat` (n-gram model) |
 | `Serialize()` / `SerializeToFile(path)` | persist the index |
 | `Deserialize(blob)` / `LoadView(base, size)` | load (copy / zero-copy mmap) |
 
-**Anchored matching.** `Count`/`Locate` find `pat` *anywhere* (substring). To match
-only at document boundaries — "log lines starting with `ERROR`", "files ending in
-`.log`" — use `LocatePrefixDocs` / `LocateSuffixDocs`; they return the sorted, unique
-document ids. Both need `SetDocStarts` to be meaningful.
+**Anchored matching.** `Count`/`Locate`/`MatchingDocs` find `pat` *anywhere* in a
+document (substring). To match only at document boundaries — "log lines starting
+with `ERROR`", "files ending in `.log`" — use `LocatePrefixDocs` /
+`LocateSuffixDocs`; they return the sorted, unique document ids.
 
 **Case-insensitive.** Pass `case_insensitive=true` to `Build`: ASCII `A-Z` are folded
 to `a-z` at build time, so every query matches case-insensitively at **zero query-time
@@ -148,11 +141,12 @@ per-row boolean — *which rows contain this pattern* — not positions. `Matchi
 returns the sorted, unique doc ids that contain `pat` exactly (`col LIKE '%pat%'`), and
 `FuzzyMatchingDocs(pat, k)` returns the doc ids that contain a substring within **edit
 distance ≤ k** of `pat` (typo / variant tolerant — names, domains, codes). Both are
-document-scoped: a match is only counted if it lies *inside* one document, so a span that
-straddles the seam between two concatenated docs is never reported. `FuzzyMatchingDocs` is
-a backtracking backward search (substitution / insertion / deletion against an error
-budget), so its cost grows fast with `k` and the alphabet — `k` is meant to be small (1–2)
-over short patterns; `k == 0` is exactly `MatchingDocs`.
+document-scoped by construction — a match always lies inside one document, since the
+injected `\0` separators keep any substring from spanning two. `FuzzyMatchingDocs` is a
+backtracking backward search (substitution / insertion / deletion against an error
+budget) that never steps through a separator, so its cost grows fast with `k` and the
+alphabet — `k` is meant to be small (1–2) over short patterns; `k == 0` is exactly
+`MatchingDocs`.
 
 **Token-level index (`TokenFMIndex`).** The byte `FMIndex` matches byte substrings.
 For LLM decontamination the unit is *N consecutive tokens* (e.g. a 13-token overlap,
@@ -173,10 +167,11 @@ turning the corpus into an unbounded-context n-gram model — `P(next=b | P) = c
 sum` — for probabilistic contamination scoring or corpus statistics. Both use only
 backward search, no extra structure.
 
-**Match context.** `Extract(pos, len)` rebuilds the original bytes from the index
-(no need to keep the source text around) — e.g. to show the line around a hit from
-`Locate`. Costs `O(len + sa_sample_rate)`. On a `case_insensitive` index, ASCII
-letters come back lowercased (original case isn't stored).
+**Match context.** `Extract(doc_id, offset, len)` rebuilds the original bytes of a
+document from the index (no need to keep the source text around) — e.g. to show the
+line around a hit from `LocateDocs`. It clamps to the document's end (never crosses
+into the next one). Costs `O(len + sa_sample_rate)`. On a `case_insensitive` index,
+ASCII letters come back lowercased (original case isn't stored).
 
 **Concurrency:** all queries are `const` and lock-free — many threads may query one
 index at once (verified: an 8-thread stress test matches single-threaded results and
