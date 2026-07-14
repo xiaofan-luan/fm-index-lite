@@ -117,6 +117,15 @@ class WaveletMatrix4 {
         }
     }
 
+    // Prefetch the level-0 quad word that access(i) / LF's first read touch.
+    // Used to warm the LF-walk in batched locate (LocateDocsBatch).
+    void
+    prefetch_access(size_t i) const {
+        if (qlevels_) {
+            qv_[0].prefetch(i);
+        }
+    }
+
     size_t
     size() const {
         return n_;

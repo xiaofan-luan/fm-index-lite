@@ -580,6 +580,98 @@ FMIndex::LocateDocs(const uint8_t* pattern, size_t plen) const {
     return out;
 }
 
+std::vector<std::vector<std::pair<uint64_t, uint64_t>>>
+FMIndex::LocateDocsBatch(
+    const std::vector<std::pair<const uint8_t*, size_t>>& patterns) const {
+    const size_t B = patterns.size();
+    std::vector<std::vector<std::pair<uint64_t, uint64_t>>> out(B);
+    if (c_.empty()) {
+        return out;
+    }
+
+    // 1. Backward-search each pattern and enqueue one walk per occurrence row.
+    //    (Backward search stays serial — the cost batched here is the LF-walk
+    //    that Locate adds on top of Count. Batch the searches with CountBatch
+    //    first if search itself dominates.)
+    struct Walk {
+        size_t row;
+        uint64_t steps;
+        uint32_t q;
+    };
+    std::vector<Walk> walks;
+    for (size_t q = 0; q < B; ++q) {
+        if (patterns[q].second == 0) {
+            continue;
+        }
+        auto r = BackwardSearch(patterns[q].first, patterns[q].second);
+        for (size_t i = r.first; i < r.second; ++i) {
+            walks.push_back({i, 0, static_cast<uint32_t>(q)});
+        }
+    }
+
+    // 2. Lock-step LF-walk the rows in tiles so independent walks' cache misses
+    //    overlap. Same structure as CountBatch: a prefetch pass then a work pass,
+    //    keeping the in-flight set small enough to stay L1-resident.
+    constexpr size_t kTile = 32;
+    std::vector<uint64_t> pos_flat(walks.size(), 0);
+    std::vector<uint8_t> done(walks.size(), 0);
+    std::vector<size_t> pend(kTile);
+    for (size_t t0 = 0; t0 < walks.size(); t0 += kTile) {
+        size_t tn = std::min(kTile, walks.size() - t0);
+        for (;;) {
+            // Collect still-walking rows; finalize any already on a sampled row.
+            size_t np = 0;
+            for (size_t s = 0; s < tn; ++s) {
+                size_t gi = t0 + s;
+                if (done[gi]) {
+                    continue;
+                }
+                if (sampled_bv_.get(walks[gi].row)) {
+                    pos_flat[gi] =
+                        sa_sample_vals_[sampled_bv_.rank1(walks[gi].row)] +
+                        walks[gi].steps;
+                    done[gi] = 1;
+                    continue;
+                }
+                pend[np++] = gi;
+            }
+            if (np == 0) {
+                break;
+            }
+            // Prefetch the two independent first-reads of each pending LF step.
+            for (size_t j = 0; j < np; ++j) {
+                wm_.prefetch_access(walks[pend[j]].row);
+            }
+            // Advance; prefetch next round's sampled-bit read as we go.
+            for (size_t j = 0; j < np; ++j) {
+                size_t gi = pend[j];
+                walks[gi].row = LF(walks[gi].row);
+                ++walks[gi].steps;
+                sampled_bv_.prefetch(walks[gi].row);
+            }
+        }
+    }
+
+    // 3. Same (doc, offset) mapping + per-pattern sort as LocateDocs.
+    std::vector<std::vector<uint64_t>> pos_per_q(B);
+    for (size_t gi = 0; gi < walks.size(); ++gi) {
+        if (done[gi] && pos_flat[gi] < text_len_) {
+            pos_per_q[walks[gi].q].push_back(pos_flat[gi]);
+        }
+    }
+    for (size_t q = 0; q < B; ++q) {
+        auto& positions = pos_per_q[q];
+        std::sort(positions.begin(), positions.end());
+        out[q].reserve(positions.size());
+        for (uint64_t pos : positions) {
+            uint64_t doc = docOf(pos);
+            out[q].emplace_back(doc, pos - doc_start_[doc]);
+        }
+        std::sort(out[q].begin(), out[q].end());
+    }
+    return out;
+}
+
 std::vector<uint64_t>
 FMIndex::LocatePrefixDocs(const uint8_t* pattern, size_t plen) const {
     std::vector<uint64_t> positions = locateInternal(pattern, plen);

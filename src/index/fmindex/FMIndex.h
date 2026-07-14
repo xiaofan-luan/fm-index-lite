@@ -86,6 +86,15 @@ class FMIndex {
     std::vector<std::pair<uint64_t, uint64_t>>
     LocateDocs(const uint8_t* pattern, size_t plen) const;
 
+    // Batched LocateDocs: result[i] is exactly LocateDocs(patterns[i]), but the
+    // per-occurrence LF-walks of ALL patterns are run in lock-step tiles so their
+    // walk cache-misses overlap (memory-level parallelism) — the locate analog of
+    // CountBatch. Wins most when patterns have few hits each (the walk, not the
+    // backward search, dominates), e.g. the document-scoped n-gram workload.
+    std::vector<std::vector<std::pair<uint64_t, uint64_t>>>
+    LocateDocsBatch(
+        const std::vector<std::pair<const uint8_t*, size_t>>& patterns) const;
+
     // Documents that BEGIN with the pattern (anchored prefix match), as sorted,
     // unique document ids. A hit is an occurrence sitting exactly on a document's
     // start boundary.

@@ -361,6 +361,43 @@ TEST(FMIndex, CountBatchMatchesPerQuery) {
     }
 }
 
+TEST(FMIndex, LocateDocsBatchMatchesPerQuery) {
+    // LocateDocsBatch(patterns)[i] must equal LocateDocs(patterns[i]). Multi-doc
+    // corpora exercise the per-occurrence LF-walk and the doc mapping.
+    std::mt19937 rng(7);
+    const char alpha[] = {'a', 'b', 'c', 'd'};
+    for (int trial = 0; trial < 30; ++trial) {
+        size_t ndocs = 1 + rng() % 5;
+        std::vector<std::string> docs;
+        for (size_t d = 0; d < ndocs; ++d) {
+            std::string doc(rng() % 60, 'a');
+            for (auto& ch : doc) {
+                ch = alpha[rng() % 4];
+            }
+            docs.push_back(doc);
+        }
+        FMIndex fm;
+        buildn(fm, docs, 1 + rng() % 8);
+        std::vector<std::string> pats;
+        for (int q = 0; q < 30; ++q) {
+            std::string p(rng() % 5, 'a');  // includes empty pattern
+            for (auto& ch : p) {
+                ch = alpha[rng() % 4];
+            }
+            pats.push_back(p);
+        }
+        std::vector<std::pair<const uint8_t*, size_t>> batch;
+        for (auto& p : pats) {
+            batch.emplace_back(bytes(p), p.size());
+        }
+        auto got = fm.LocateDocsBatch(batch);
+        CHECK_EQ(got.size(), pats.size());
+        for (size_t i = 0; i < pats.size(); ++i) {
+            CHECK_EQ(got[i], fm.LocateDocs(bytes(pats[i]), pats[i].size()));
+        }
+    }
+}
+
 TEST(FMIndex, DnaReadAlignment) {
     std::string ref = "ACGTTGCACGATTACAGGATCCACGTACGTTGCA";
     FMIndex fm;
