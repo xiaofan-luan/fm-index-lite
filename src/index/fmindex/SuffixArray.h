@@ -46,6 +46,50 @@ build_suffix_array(const std::vector<uint32_t>& s) {
     return sa;
 }
 
+// Suffix array of a dense-symbol sequence that ALREADY carries its trailing
+// sentinel (dense id 0, unique-smallest, appears once at t[m-1]). Content ids
+// are in [2, sigma) and the document separator is id 1; because the remap is
+// order-preserving, the id SA order equals the byte/token SA order. This is the
+// v2 build path — the separator is a symbol OUTSIDE the byte alphabet, so any
+// byte (including '\0') is storable and queryable. `libsais_int` documents that
+// it modifies the input during construction but RESTORES it on success, so the
+// caller may reuse `t` afterward (FMIndex computes the BWT from it). For m < 2^31.
+inline std::vector<int32_t>
+build_suffix_array_symbols32(int32_t* t, size_t m, int32_t sigma) {
+    if (m <= 1) {
+        return std::vector<int32_t>(m, 0);  // empty or lone-sentinel: SA=[0] or []
+    }
+    const int32_t fs = 6 * 1024;  // recommended free space for performance
+    std::vector<int32_t> sa(m + fs);
+#ifdef LIBSAIS_OPENMP
+    libsais_int_omp(t, sa.data(), static_cast<int32_t>(m), sigma, fs, 0);
+#else
+    libsais_int(t, sa.data(), static_cast<int32_t>(m), sigma, fs);
+#endif
+    sa.resize(m);
+    return sa;
+}
+
+// 64-bit counterpart (int64 positions), for m >= 2^31 and up to 2^63. Same
+// semantics and identical result values as the 32-bit path; uses libsais64_long,
+// the integer-alphabet SA over 64-bit indices. 8 bytes/position, so prefer the
+// 32-bit path when m < 2^31.
+inline std::vector<int64_t>
+build_suffix_array_symbols64(int64_t* t, size_t m, int64_t sigma) {
+    if (m <= 1) {
+        return std::vector<int64_t>(m, 0);
+    }
+    const int64_t fs = 6 * 1024;
+    std::vector<int64_t> sa(m + fs);
+#ifdef LIBSAIS_OPENMP
+    libsais64_long_omp(t, sa.data(), static_cast<int64_t>(m), sigma, fs, 0);
+#else
+    libsais64_long(t, sa.data(), static_cast<int64_t>(m), sigma, fs);
+#endif
+    sa.resize(m);
+    return sa;
+}
+
 // Suffix array of the sentinel-terminated text, built directly over BYTES with
 // the byte-oriented libsais — no int32 remap of the text is materialized, which
 // is the bulk of the build-memory saving. libsais treats end-of-string as

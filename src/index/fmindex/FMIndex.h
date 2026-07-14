@@ -14,30 +14,33 @@
 namespace milvus::index::fmindex {
 
 // FM-index over a set of documents. You feed the documents already split; the
-// index concatenates them internally and injects a NUL ('\0') separator after
-// each one, so every query is inherently document-scoped (row semantics): a
-// pattern that contains no '\0' — all valid UTF-8 text qualifies — can never
-// match across a document boundary, because any cross-document substring would
-// have to straddle a separator. Bytes are remapped to a dense alphabet
-// [1, sigma) (0 = sentinel), so the wavelet matrix uses only ceil(log2(sigma))
-// levels. Exact substring count / locate / (doc, offset) via BWT backward
-// search; no false positives, and no matches spanning two documents.
+// index concatenates them internally and injects a separator symbol after each
+// one, so every query is inherently document-scoped (row semantics): no query
+// can ever match across a document boundary, because any cross-document
+// substring would have to straddle the separator. The separator is a symbol
+// OUTSIDE the byte alphabet (dense id 1), NOT the byte '\0' — so every byte
+// value 0..255, '\0' included, is ordinary content that is stored and queried
+// byte-exactly. Dense alphabet: id 0 = sentinel, id 1 = separator, ids 2..sigma
+// = distinct content bytes (ascending order-preserving), so the wavelet matrix
+// uses only ceil(log2(sigma)) levels. Exact substring count / locate /
+// (doc, offset) via BWT backward search; no false positives, no cross-document
+// matches.
 class FMIndex {
  public:
     FMIndex() = default;
 
     // Build the index over a set of documents. Document i (0-based, in the order
     // given) is the unit every query result is attributed to and never crosses.
-    // The documents are concatenated internally with a '\0' separator after each,
-    // so results are inherently per-document; you own nothing but the split.
+    // The documents are concatenated internally with a separator symbol after
+    // each, so results are inherently per-document; you own nothing but the split.
     //
-    //   docs            the documents, in order. Contents MUST NOT contain a
-    //                   '\0' byte (that is the separator); valid UTF-8 never
-    //                   does — Build throws std::invalid_argument if one does.
-    //                   A UTF-8 CJK char counts as its 3 bytes. The total
-    //                   internal size (sum of doc sizes + one byte per doc) must
-    //                   be < 2^31 for the compact path, < 2^63 always; for larger
-    //                   corpora, shard and build one index per shard.
+    //   docs            the documents, in order. Contents may be ANY bytes,
+    //                   '\0' included — the separator is a symbol outside the
+    //                   byte alphabet, so nothing is reserved. A UTF-8 CJK char
+    //                   counts as its 3 bytes. The total internal size (sum of
+    //                   doc sizes + one separator per doc) must be < 2^31 for the
+    //                   compact path, < 2^63 always; for larger corpora, shard
+    //                   and build one index per shard.
     //   sa_sample_rate  suffix-array sampling rate R (>= 1): store one SA value
     //                   every R text positions, recovering the rest via LF-
     //                   mapping. Pure space/locate trade-off, zero effect on
@@ -80,7 +83,7 @@ class FMIndex {
         const;
 
     // Sorted (doc_id, offset_within_doc) of every occurrence. Because documents
-    // are '\0'-separated internally, no occurrence can span two documents, so
+    // are separator-delimited internally, no occurrence can span two documents, so
     // every hit is a genuine in-document match. An empty pattern returns no hits
     // (as do MatchingDocs / prefix / suffix / FuzzyMatchingDocs).
     std::vector<std::pair<uint64_t, uint64_t>>
@@ -129,8 +132,8 @@ class FMIndex {
     // The longest substring of `query` that occurs in the corpus (fuzzy / partial
     // contamination: "how long a span of this benchmark item appears in training",
     // which catches paraphrased or truncated overlaps that an exact n-gram misses).
-    // Because the corpus is '\0'-separated, the reported span is always contained
-    // in a single document — i.e. the longest match found across all documents,
+    // Because the corpus is separator-delimited, the reported span is always
+    // contained in a single document — i.e. the longest match across all documents,
     // never one stitched across a document boundary. Returns the match length,
     // its start offset in `query`, and how many times it occurs in the corpus.
     // length == 0 means no single query byte occurs.
@@ -145,9 +148,9 @@ class FMIndex {
 
     // Distribution of the byte that FOLLOWS context P: (byte, count) for every
     // byte b such that P·b occurs, sorted by byte. This turns the corpus into an
-    // n-gram model — P(next=b | P) = count_b / sum(counts). The '\0' separator is
-    // excluded, so an occurrence of P at the end of its document contributes no
-    // following byte; the sum can therefore be less than Count(P). O(sigma*plen).
+    // n-gram model — P(next=b | P) = count_b / sum(counts). The separator symbol
+    // is not a byte, so an occurrence of P at the end of its document contributes
+    // no following byte; the sum can therefore be less than Count(P). O(sigma*plen).
     std::vector<std::pair<uint8_t, size_t>>
     NextTokenCounts(const uint8_t* pattern, size_t plen) const;
 
@@ -160,7 +163,7 @@ class FMIndex {
     // Sorted, unique document ids containing a substring within edit distance
     // <= k of `pat` (typo / variant tolerant: names, domains, codes). Also
     // doc-granularity. Implemented by backtracking backward search that never
-    // steps through the '\0' separator, so a matched substring always lies inside
+    // steps through the separator symbol, so a matched substring always lies inside
     // one document. Cost grows fast with k and the alphabet — k is meant to be
     // small (1-2) over short patterns. k == 0 is exactly MatchingDocs.
     std::vector<uint64_t>
@@ -259,10 +262,14 @@ class FMIndex {
     uint32_t sa_sample_rate_ = 1;
     bool case_fold_ = false;             // ASCII A-Z folded to a-z at build time
     bool wide_storage_ = false;          // sampled-SA positions stored 8B (>=4GiB)
-    uint64_t text_len_ = 0;              // INTERNAL byte count incl. '\0' seps, no sentinel
-    uint32_t sigma_ = 1;                 // dense alphabet size incl sentinel
+    uint64_t text_len_ = 0;              // INTERNAL length incl. separators, no sentinel
+    uint32_t sigma_ = 2;                 // dense alphabet size (incl. sentinel + separator)
     uint32_t qlevels_ = 0;              // ceil(ceil(log2(sigma_)) / 2)
-    std::array<int32_t, 256> byte_to_id_{};  // byte -> dense id, -1 if absent
+    // byte -> dense content id in [2, sigma), or -1 if the byte is absent from
+    // the corpus. Ids 0 (sentinel) and 1 (separator) are never byte ids, so no
+    // query byte can address the separator — that is what keeps '\0' queryable
+    // as content while cross-document matches remain impossible.
+    std::array<int32_t, 256> byte_to_id_{};
     WaveletMatrix4 wm_;                 // 4-ary quad matrix over the BWT
     std::vector<uint64_t> c_;           // C-table, size sigma_ (counts up to len)
     std::vector<size_t> first_;         // per-symbol map_zero (derived, not serialized)
@@ -273,9 +280,9 @@ class FMIndex {
     // Internal document boundaries (offsets into the separator-injected buffer),
     // size n_docs+1: doc_start_[d] = internal start of doc d, doc_start_[n_docs]
     // = text_len_. Doc d's content is [doc_start_[d], doc_start_[d+1]-1) with the
-    // '\0' at doc_start_[d+1]-1. sep_id_ is the dense id of that '\0'.
+    // separator symbol at doc_start_[d+1]-1.
     std::vector<uint64_t> doc_start_;
-    int32_t sep_id_ = -1;  // dense id of the '\0' separator (derived from byte_to_id_)
+    int32_t sep_id_ = 1;  // dense id of the separator symbol (constant; not a byte)
     // Derived, in-RAM only (rebuilt on load, never serialized):
     std::vector<uint8_t> id_to_byte_;    // dense id -> byte (inverse of byte_to_id_)
     std::vector<uint64_t> isa_sample_;   // isa_sample_[k] = row whose SA value = k*rate

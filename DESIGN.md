@@ -1,5 +1,13 @@
 # fm-index-lite — Design
 
+> **⚠ Separator / encoding scheme updated (v2).** The separator is now a symbol
+> *outside* the byte alphabet (dense id 1), so `\0` is ordinary queryable content
+> — see **`DESIGN-v2.md`** for the authoritative encoding, SA construction, and
+> the token-mode plan. The §1–§2 descriptions below still say "`\0` separator" /
+> "ids `1..σ-1`"; read them as **id 0 = sentinel, id 1 = separator, ids 2..σ-1 =
+> content bytes**. Everything else here (query algorithms, structures, §3–§9)
+> remains accurate.
+
 A self-contained C++17 FM-index for **exact substring search** over byte data:
 occurrence **count**, **locate** (positions), and **(document, offset)** mapping,
 with batched throughput for bulk workloads. Built as the prototype for a Milvus
@@ -334,6 +342,18 @@ column's row values (one document per row); queries fan out and aggregate.
   bwa-mem2-style 2-bit occ) costs effort for a non-target workload.
 - **Repetitive corpora**: an r-index (RLBWT) could be ~10× smaller on heavily
   deduplicated training data — worth measuring BWT-run density on real data first.
+- **Damerau transpositions in `FuzzyMatchingDocs`** (opt-in flag): one extra
+  deterministic DFS branch — consume `P[i-1]` then `P[i]` in swapped order at
+  cost 1; memo key `(lo, hi, i)` unchanged. Needed to align with
+  Damerau-Levenshtein consumers (e.g. Milvus `text_match_fuzzy`, tantivy /
+  Elasticsearch semantics); plain Levenshtein stays the default. Test with a
+  brute-force Damerau-OSA oracle. Note the byte-vs-char caveat: edits here are
+  byte edits, so char-level alignment holds for ASCII only.
+- **`\0` in document content / token-level mode / Milvus-alignment APIs**:
+  superseded by the v2 symbol-domain redesign — see `DESIGN-v2.md` (separator
+  moved outside the byte alphabet, so `\0` is storable *and* queryable; token
+  sequences over `libsais16`/`libsais_int`; streaming sink, interval reuse,
+  visitor outputs, `EqualsDocs`).
 
 ## Provenance (all permissive)
 

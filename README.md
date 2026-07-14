@@ -26,14 +26,14 @@ count, and locate — up to several× on batched count — at equal index size. 
 ## Modeling your business data
 
 You feed the index your documents **already split** — a list of byte strings. It
-concatenates them internally and injects a `\0` separator after each, so every
-result is **document-scoped (row semantics)**: no query can ever match across a
-document boundary.
+concatenates them internally and injects a separator **symbol** after each, so
+every result is **document-scoped (row semantics)**: no query can ever match
+across a document boundary.
 
 ```
 docs = [ "doc A text...", "doc B text...", "doc C text..." ]
 
-internal = "doc A text...\0doc B text...\0doc C text...\0"   // separators injected for you
+internal = "doc A text..." ⎵ "doc B text..." ⎵ "doc C text..." ⎵   // ⎵ = separator symbol (not a byte)
 ```
 
 - A "document" is whatever unit you want results attributed to and to act on — a
@@ -42,22 +42,22 @@ internal = "doc A text...\0doc B text...\0doc C text...\0"   // separators injec
 - **You own nothing but the split.** `LocateDocs` returns `(doc_id,
   offset_within_doc)`; `MatchingDocs`/`FuzzyMatchingDocs` return doc ids; `Extract`
   takes `(doc_id, offset, len)`. No global offsets to manage.
-- **Contents must not contain `\0`** — that byte is the separator. All valid UTF-8
-  text qualifies (UTF-8 never encodes a NUL except for U+0000 itself). Everything
-  else is arbitrary bytes — raw logs, `{A,C,G,T}`, binary. Matching is byte-exact
+- **Contents may be ANY bytes — `\0` included.** The separator is a symbol
+  *outside* the byte alphabet (an internal dense id), so no byte value is reserved:
+  raw logs, `{A,C,G,T}`, binary, embedded NULs all index and match byte-exactly
   (optionally ASCII-case-insensitive).
-- **No cross-document matches — ever, in any operation.** Because a pattern free of
-  `\0` cannot span a separator, a substring that would straddle two documents (e.g.
-  docs `"ab"`,`"cd"` — `"bc"`) simply does not exist in the index. This holds for
-  *every* primitive, `Count` included — not just the document-attributed ones — so
-  `Count` is per-document exact **and** still O(1) in the match interval.
+- **No cross-document matches — ever, in any operation.** No query byte maps to the
+  separator symbol, so a substring that would straddle two documents (e.g. docs
+  `"ab"`,`"cd"` — `"bc"`) simply does not exist in the index — and this holds even
+  when the boundary byte would be `\0`. It applies to *every* primitive, `Count`
+  included, so `Count` is per-document exact **and** still O(1) in the match interval.
 - One index handles corpora up to **2^63 bytes**: the suffix array is built with
   32-bit indices under 2 GiB (compact, less build memory) and 64-bit indices at or
   above it — chosen automatically. Sampled positions likewise serialize 4 bytes
   wide under 4 GiB, 8 above, so a small corpus keeps a small index. Going past
-  2 GiB in one index is mostly limited by **build memory** (~8× the corpus), so for
-  large data prefer one index per shard/segment (this is how it plugs into Milvus,
-  one index per sealed segment).
+  2 GiB in one index is mostly limited by **build memory** (~10× the corpus with
+  the int32 symbol-text SA path), so for large data prefer one index per
+  shard/segment (this is how it plugs into Milvus, one index per sealed segment).
 
 ## Quick start
 
@@ -66,10 +66,10 @@ internal = "doc A text...\0doc B text...\0doc C text...\0"   // separators injec
 using namespace milvus::index::fmindex;
 
 // 1. build straight from your split documents — the index concatenates them and
-//    injects the '\0' separators for you.
+//    injects the separator symbols for you.
 //    Build(docs, sa_sample_rate = 32, case_insensitive = false)
 //      docs           your documents, in order (document i gets doc id i);
-//                     contents must not contain '\0'
+//                     contents may be any bytes, '\0' included
 //      sa_sample_rate SA sampling rate: space/locate trade-off, no effect on
 //                     Count — default 32 is balanced; 4-8 = faster LocateDocs,
 //                     bigger index; 64+ = smaller index if you only Count
@@ -141,7 +141,7 @@ returns the sorted, unique doc ids that contain `pat` exactly (`col LIKE '%pat%'
 `FuzzyMatchingDocs(pat, k)` returns the doc ids that contain a substring within **edit
 distance ≤ k** of `pat` (typo / variant tolerant — names, domains, codes). Both are
 document-scoped by construction — a match always lies inside one document, since the
-injected `\0` separators keep any substring from spanning two. `FuzzyMatchingDocs` is a
+injected separator symbols keep any substring from spanning two. `FuzzyMatchingDocs` is a
 backtracking backward search (substitution / insertion / deletion against an error
 budget) that never steps through a separator, so its cost grows fast with `k` and the
 alphabet — `k` is meant to be small (1–2) over short patterns; `k == 0` is exactly

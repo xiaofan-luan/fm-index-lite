@@ -29,37 +29,26 @@ namespace milvus::index::fmindex {
 void
 FMIndex::Build(const std::vector<std::string_view>& docs, uint32_t sa_sample_rate,
                bool case_insensitive, bool force_wide) {
-    // Concatenate the documents into one internal buffer, injecting a '\0'
-    // separator after each. That separator is what makes every query
-    // document-scoped: no pattern free of '\0' can match a substring that
-    // straddles it, so cross-document matches simply do not exist in the index.
+    // Internal layout: each document's bytes are remapped to dense content ids,
+    // and a separator symbol (dense id 1, OUTSIDE the byte alphabet) is injected
+    // after each. That separator makes every query document-scoped: no query
+    // byte maps to id 1, so no match can straddle a boundary — and this holds
+    // for every byte value, so '\0' is ordinary queryable content. The internal
+    // coordinate system (one symbol per content byte, one per separator) is
+    // identical to the byte offsets, so doc_start_ / text_len_ are byte offsets.
     uint64_t internal_len = 0;
-    for (const auto& d : docs) {
-        internal_len += d.size() + 1;  // + separator
-    }
-    std::vector<uint8_t> buf;
-    buf.reserve(internal_len);
     doc_start_.clear();
     doc_start_.reserve(docs.size() + 1);
     for (const auto& d : docs) {
-        // '\0' is the reserved document separator; a document that contains it
-        // would forge a boundary and break the no-cross-document guarantee.
-        if (std::memchr(d.data(), '\0', d.size()) != nullptr) {
-            throw std::invalid_argument(
-                "FMIndex::Build: document contains a '\\0' byte (reserved as "
-                "the document separator)");
-        }
-        doc_start_.push_back(buf.size());
-        buf.insert(buf.end(), d.begin(), d.end());
-        buf.push_back('\0');  // document separator
+        doc_start_.push_back(internal_len);
+        internal_len += d.size() + 1;  // content + one separator
     }
-    doc_start_.push_back(buf.size());  // end boundary (== internal_len)
-    const uint8_t* data = buf.data();
+    doc_start_.push_back(internal_len);  // end boundary (== internal_len)
     const size_t len = static_cast<size_t>(internal_len);
 
     // Suffix array is built with 32-bit indices under 2 GiB (compact) and 64-bit
-    // indices at or above it (libsais64). Only the astronomically large 2^63
-    // ceiling of the 64-bit path is a hard error.
+    // indices at or above it. Only the astronomically large 2^63 ceiling is a
+    // hard error.
     const bool use64 = force_wide || len >= (static_cast<size_t>(INT32_MAX));
     if (len >= (static_cast<size_t>(1) << 63)) {
         throw std::length_error("FMIndex: corpus too large (>= 2^63 bytes)");
@@ -76,16 +65,18 @@ FMIndex::Build(const std::vector<std::string_view>& docs, uint32_t sa_sample_rat
         return (cf && b >= 'A' && b <= 'Z') ? static_cast<uint8_t>(b + 32) : b;
     };
 
-    // 1. dense alphabet: distinct (folded) bytes -> ids 1..sigma-1 (0 =
-    //    sentinel), order-preserving so lexicographic order of ids matches
-    //    bytes. With case folding, both cases of a letter alias to one id, so
-    //    the query hot path stays a plain byte_to_id_ lookup (no fold branch).
+    // 1. dense alphabet: id 0 = sentinel, id 1 = separator, ids 2..sigma-1 =
+    //    distinct (folded) content bytes in ascending order (order-preserving so
+    //    id order matches byte order). With case folding both cases of a letter
+    //    alias to one id, so the query hot path stays a plain byte_to_id_ lookup.
     std::array<bool, 256> present{};
-    for (size_t i = 0; i < len; ++i) {
-        present[fold(data[i])] = true;
+    for (const auto& d : docs) {
+        for (unsigned char c : d) {
+            present[fold(c)] = true;
+        }
     }
     byte_to_id_.fill(-1);
-    uint32_t id = 1;
+    uint32_t id = 2;  // 0 = sentinel, 1 = separator (reserved, non-byte)
     for (int b = 0; b < 256; ++b) {
         if (present[b]) {
             byte_to_id_[b] = static_cast<int32_t>(id++);
@@ -96,58 +87,63 @@ FMIndex::Build(const std::vector<std::string_view>& docs, uint32_t sa_sample_rat
             byte_to_id_[b] = byte_to_id_[b + 32];  // uppercase aliases lowercase
         }
     }
-    sigma_ = id;  // sentinel + number of distinct bytes
+    sigma_ = id;  // sentinel + separator + number of distinct content bytes
     uint32_t bits = 1;
     while ((1u << bits) < sigma_) {
         ++bits;
     }
     qlevels_ = (bits + 1) / 2;  // 2 bits per quad level
 
-    // 2. suffix array — built directly over bytes (see build_suffix_array_bytes),
-    //    so no int32 dense-id copy of the whole text is materialized. For a
-    //    case-insensitive index the SA must sort by the folded bytes, so feed a
-    //    folded copy; otherwise libsais reads the caller's buffer in place.
-    const size_t m = len + 1;
-    // 32-bit SA under 2 GiB, 64-bit at/above it (or when forced). Only one of
-    // the two buffers is allocated; sa_at() reads whichever, as a 64-bit value.
-    std::vector<int32_t> sa32;
-    std::vector<int64_t> sa64;
-    {
-        std::vector<uint8_t> folded;
-        const uint8_t* sa_input = data;
-        if (case_fold_) {
-            folded.resize(len);
-            for (size_t i = 0; i < len; ++i) {
-                folded[i] = fold(data[i]);
+    const size_t m = len + 1;  // + trailing sentinel
+    // 2. Materialize the dense-id symbol text t (content ids, separators id 1,
+    //    trailing sentinel id 0) and build the SA over it. byte_to_id_ already
+    //    collapses letter case (uppercase aliases lowercase's id), so the symbol
+    //    text is folded implicitly — no separate folded byte copy. libsais
+    //    restores t on success, so it is reused below to compute the BWT.
+    //    Only one of t32/t64 (and sa32/sa64) is allocated.
+    std::vector<int32_t> t32, sa32;
+    std::vector<int64_t> t64, sa64;
+    auto fill_symbols = [&](auto& t) {
+        t.resize(m);
+        size_t pos = 0;
+        for (const auto& d : docs) {
+            for (unsigned char c : d) {
+                t[pos++] = byte_to_id_[c];  // content id (>= 2), case-folded
             }
-            sa_input = folded.data();
+            t[pos++] = 1;  // separator
         }
-        if (use64) {
-            sa64 = build_suffix_array_bytes64(sa_input, len);
-        } else {
-            sa32 = build_suffix_array_bytes(sa_input, len);
-        }
-    }  // folded buffer freed here
+        t[pos] = 0;  // trailing sentinel (pos == len == m-1)
+    };
+    if (use64) {
+        fill_symbols(t64);
+        sa64 = build_suffix_array_symbols64(
+            t64.data(), m, static_cast<int64_t>(sigma_));
+    } else {
+        fill_symbols(t32);
+        sa32 = build_suffix_array_symbols32(
+            t32.data(), m, static_cast<int32_t>(sigma_));
+    }
     FMIX_MEM("after SA");
     auto sa_at = [&](size_t i) -> uint64_t {
         return use64 ? static_cast<uint64_t>(sa64[i])
                      : static_cast<uint64_t>(sa32[i]);
     };
+    auto t_at = [&](size_t i) -> uint16_t {
+        return use64 ? static_cast<uint16_t>(t64[i])
+                     : static_cast<uint16_t>(t32[i]);
+    };
 
-    // 3. BWT of dense ids, computed inline from data + sa (no dense-id text
-    //    array). bwt[i] is the symbol preceding row i's suffix; row 0's suffix
-    //    starts at position 0 so its predecessor wraps to the sentinel (0). The
-    //    aliased byte_to_id_ maps both letter cases to one id in folded mode.
-    // BWT symbols are dense ids in [0, sigma) with sigma <= 257, so uint16 holds
-    // them and halves this buffer (and the wavelet partition buffers it feeds).
+    // 3. BWT of dense ids, read straight from the symbol text: bwt[i] is the
+    //    symbol preceding row i's suffix; row where sa[i]==0 wraps to the
+    //    sentinel (0). Symbols are dense ids in [0, sigma) (<= 258 for bytes), so
+    //    uint16 holds them and halves this buffer and the wavelet's.
     std::vector<uint16_t> bwt(m);
     for (size_t i = 0; i < m; ++i) {
         uint64_t v = sa_at(i);
-        bwt[i] = (v == 0) ? uint16_t{0}
-                          : static_cast<uint16_t>(byte_to_id_[data[v - 1]]);
+        bwt[i] = (v == 0) ? uint16_t{0} : t_at(v - 1);
     }
-    std::vector<uint8_t>().swap(buf);  // internal text no longer needed
-    data = nullptr;
+    std::vector<int32_t>().swap(t32);  // symbol text no longer needed
+    std::vector<int64_t>().swap(t64);
     FMIX_MEM("after BWT");
 
     // 4. C-table over sigma_ (cumulative counts can reach m, so 64-bit)
@@ -203,7 +199,9 @@ FMIndex::buildDerived() {
             id_to_byte_[byte_to_id_[b]] = static_cast<uint8_t>(b);
         }
     }
-    sep_id_ = byte_to_id_[0];  // dense id of the '\0' separator (-1 if none)
+    // The separator is a fixed synthetic symbol (dense id 1), not a byte. No
+    // byte_to_id_ entry equals 1, so a query byte can never step onto it.
+    sep_id_ = 1;
     // isa_sample_[k] = the BWT row whose suffix starts at text position k*rate.
     // Every multiple of rate in [0, text_len_] appears exactly once in the SA,
     // so this array is fully populated. Gives Extract an anchor within `rate`
@@ -273,8 +271,8 @@ FMIndex::LongestMatch(const uint8_t* query, size_t qlen) const {
         size_t lo = 0, hi = m, len = 0;
         for (size_t k = e + 1; k-- > 0;) {
             int32_t id = byte_to_id_[query[k]];
-            if (id < 0 || id == sep_id_) {
-                break;  // byte absent, or the separator — match cannot extend
+            if (id < 0) {
+                break;  // byte absent from the corpus — match cannot extend
             }
             auto pp = wm_.map2(static_cast<uint32_t>(id), lo, hi);
             size_t base = c_[id] - first_[id];
@@ -309,7 +307,7 @@ FMIndex::NextTokenCounts(const uint8_t* pattern, size_t plen) const {
     // count(P·b) = number of occurrences of the (plen+1)-length string P then b.
     std::vector<uint8_t> buf(pattern, pattern + plen);
     buf.push_back(0);
-    for (int b = 1; b < 256; ++b) {  // skip b==0: the '\0' separator, not a real byte
+    for (int b = 0; b < 256; ++b) {  // every byte is real content in v2
         if (byte_to_id_[b] < 0) {
             continue;  // byte never appears in the corpus
         }
@@ -360,10 +358,9 @@ FMIndex::FuzzyMatchingDocs(const uint8_t* pat, size_t plen, uint32_t k) const {
                 return;
             }
             visited[key] = e;
+            // Every pattern byte maps to a content id (>= 2) or -1 if absent;
+            // it can never be the separator (id 1), which no byte addresses.
             int32_t tid = byte_to_id_[pat[i - 1]];
-            if (tid == sep_id_) {
-                tid = -1;  // a '\0' in the pattern never matches a real byte
-            }
             auto step = [&](uint32_t d, size_t& nlo, size_t& nhi) {
                 auto pp = wm_.map2(d, lo, hi);
                 size_t base = c_[d] - first_[d];
@@ -441,8 +438,8 @@ FMIndex::BackwardSearch(const uint8_t* pattern, size_t plen) const {
     size_t lo = 0, hi = m;
     for (size_t k = plen; k-- > 0;) {
         int32_t id = byte_to_id_[pattern[k]];
-        if (id < 0 || id == sep_id_) {
-            return {0, 0};  // byte absent, or the '\0' separator (never queryable)
+        if (id < 0) {
+            return {0, 0};  // byte absent from the corpus: no match
         }
         auto pp = wm_.map2(static_cast<uint32_t>(id), lo, hi);
         size_t base = c_[id] - first_[id];
@@ -498,7 +495,7 @@ FMIndex::CountBatch(
                     continue;
                 }
                 int32_t id = byte_to_id_[patterns[t0 + s].first[posn[s]]];
-                if (id < 0 || id == sep_id_) {
+                if (id < 0) {
                     active[s] = 0;
                     continue;
                 }
@@ -734,7 +731,9 @@ get(const char*& p, const char* end) {
     return v;
 }
 constexpr uint32_t kMagic = 0x464D4958;  // "FMIX"
-constexpr uint32_t kFormatVersion = 6;  // v6: docs '\0'-separated, doc_start_ internal
+// v7: separator is an out-of-byte-alphabet symbol (dense id 1), so '\0' is
+// ordinary content; content ids are 2..sigma. Not backward-compatible with v6.
+constexpr uint32_t kFormatVersion = 7;
 }  // namespace
 
 void
@@ -861,8 +860,8 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         uint32_t flags = get<uint32_t>(p, end);  // former pad, now flags
         case_fold_ = (flags & 1u) != 0;
         wide_storage_ = (flags & 2u) != 0;
-        if (sigma_ == 0 || sigma_ > 257 || qlevels_ > 5) {
-            return false;
+        if (sigma_ < 2 || sigma_ > 258 || qlevels_ > 5) {
+            return false;  // 2 (sentinel+sep) .. 258 (+256 content bytes)
         }
         // qlevels_ must be exactly what Build derives from sigma_ (2 bits/level
         // over ceil(log2(sigma_)) bits). A mismatched value would consume the
@@ -880,10 +879,13 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         text_len_ = get<uint64_t>(p, end);
         for (int i = 0; i < 256; ++i) {
             byte_to_id_[i] = get<int32_t>(p, end);
-            // A byte maps to -1 (absent) or a dense id in [1, sigma_). Anything
-            // else would index c_/first_ (size sigma_) out of bounds in a query.
-            if (byte_to_id_[i] < -1 ||
-                byte_to_id_[i] >= static_cast<int32_t>(sigma_)) {
+            // A byte maps to -1 (absent) or a content id in [2, sigma_). Ids 0
+            // (sentinel) and 1 (separator) are never byte ids; anything outside
+            // this set would either index c_/first_ out of bounds or alias a
+            // query byte onto the separator.
+            if (byte_to_id_[i] != -1 &&
+                (byte_to_id_[i] < 2 ||
+                 byte_to_id_[i] >= static_cast<int32_t>(sigma_))) {
                 return false;
             }
         }

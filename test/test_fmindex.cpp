@@ -316,11 +316,12 @@ TEST(FMIndex, RandomizedFuzzVsBruteForce) {
 }
 
 TEST(FMIndex, UTF8AndBoundaryBytes) {
-    // Multibyte UTF-8 plus boundary bytes 0xff / 0x01. NUL (0x00) is reserved as
-    // the document separator, so document contents never contain it.
+    // Multibyte UTF-8 plus boundary bytes 0xff / 0x01 / 0x00. v2 indexes '\0' as
+    // ordinary content.
     std::string text = "caf\xc3\xa9 \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e ";
     text.push_back('\xff');
     text.push_back('\x01');
+    text.push_back('\0');
     text += "test";
     FMIndex fm;
     build1(fm, text, 3);
@@ -501,20 +502,20 @@ TEST(FMIndex, SingleCharAndAllSame) {
 }
 
 TEST(FMIndex, FullByteAlphabetAndBinary) {
-    // Every byte value 1..255 present (0 is reserved as the separator, which the
-    // build injects), arbitrary binary content. alphabet == 255 content bytes +
-    // separator '\0' + sentinel == 257.
+    // Every byte value 0..255 present as content (v2: '\0' is a normal content
+    // byte; the document separator is an out-of-byte-alphabet symbol), arbitrary
+    // binary content. alphabet == 256 content bytes + separator + sentinel == 258.
     std::mt19937 rng(2024);
     std::string text;
-    for (int i = 1; i < 256; ++i) {
+    for (int i = 0; i < 256; ++i) {
         text.push_back(static_cast<char>(i));
     }
     for (int i = 0; i < 4000; ++i) {
-        text.push_back(static_cast<char>(1 + (rng() % 255)));  // never 0
+        text.push_back(static_cast<char>(rng() % 256));  // any byte incl. 0
     }
     FMIndex fm;
     build1(fm, text, 8);
-    CHECK_EQ(fm.alphabet(), 257u);  // 255 bytes + separator + sentinel
+    CHECK_EQ(fm.alphabet(), 258u);  // 256 bytes + separator + sentinel
     // check a handful of substrings against brute force
     std::mt19937 rng2(5);
     for (int q = 0; q < 50; ++q) {
@@ -1436,33 +1437,71 @@ TEST(FMIndex, EmptyPatternDocApisReturnEmpty) {
     CHECK_EQ(fm.Count(e, 0), fm.bwt_size());
 }
 
-TEST(FMIndex, BuildRejectsNulInDocument) {
-    std::string bad = "ab";
-    bad.push_back('\0');  // reserved separator byte inside a document
-    bad += "cd";
+TEST(FMIndex, NulByteInContentIsIndexed) {
+    // v2: '\0' is a first-class content byte, not the document separator. A
+    // single document containing '\0' indexes normally and matches byte-exactly,
+    // including patterns that contain '\0'.
+    std::string text = "ab";
+    text.push_back('\0');
+    text += "cd";
+    text.push_back('\0');
+    text += "ab";  // "ab\0cd\0ab"
     FMIndex fm;
-    bool threw = false;
-    try {
-        fm.Build(std::vector<std::string_view>{std::string_view(bad)}, 4);
-    } catch (const std::invalid_argument&) {
-        threw = true;
+    build1(fm, text, 1);
+    for (std::string pat : {std::string("ab"), std::string("cd"),
+                            std::string("b\0c", 3), std::string("\0", 1),
+                            std::string("ab\0cd", 5), std::string("d\0a", 3),
+                            std::string("x")}) {
+        CHECK_EQ(fm.Count(bytes(pat), pat.size()), brute_count(text, pat));
+        CHECK_EQ(offsets(fm, pat), brute_positions(text, pat));
     }
-    CHECK(threw);
 }
 
-TEST(FMIndex, FuzzyPatternWithNul) {
+TEST(FMIndex, NulByteContentDoesNotCrossDocuments) {
+    // '\0' as content (mapped to a real dense id) is distinct from the internal
+    // document separator (an out-of-byte-alphabet symbol), so a query can never
+    // match across a document boundary even when the boundary byte would be '\0'.
+    std::vector<std::string> docs = {std::string("a\0b", 3),
+                                     std::string("c\0d", 3)};
     FMIndex fm;
-    buildn(fm, {"cat", "cab", "dog"}, 2);
-    // pattern "ca\0" contains the reserved separator; the '\0' is treated as a
-    // non-matching symbol (edit only), and the search never crosses a document.
-    std::string pat = "ca";
-    pat.push_back('\0');
-    // within edit distance 1 of "ca\0": "cat"(sub), "cab"(sub), "ca"(delete)
-    std::vector<uint64_t> expect = {0, 1};
-    CHECK_EQ(fm.FuzzyMatchingDocs(bytes(pat), pat.size(), 1), expect);
-    // an exact match of a NUL-containing pattern finds nothing (never the sep).
-    CHECK(fm.MatchingDocs(bytes(pat), pat.size()).empty());
-    CHECK_EQ(fm.Count(bytes(pat), pat.size()), size_t(0));
+    buildn(fm, docs, 1);
+    // "\0" occurs once in each document.
+    std::string nul("\0", 1);
+    std::vector<uint64_t> both = {0, 1};
+    CHECK_EQ(fm.MatchingDocs(bytes(nul), 1), both);
+    CHECK_EQ(fm.Count(bytes(nul), 1), size_t(2));
+    // Anchored + full-document matches see '\0' as content.
+    CHECK_EQ(fm.MatchingDocs(bytes(std::string("a\0b", 3)), 3),
+             std::vector<uint64_t>{0});
+    // A pattern that would only match by spanning the doc separator finds nothing.
+    CHECK(fm.MatchingDocs(bytes(std::string("b\0c", 3)), 3).empty());
+    CHECK(fm.MatchingDocs(bytes(std::string("bc", 2)), 2).empty());
+}
+
+TEST(FMIndex, RandomizedFuzzWithNulBytes) {
+    // Same differential-oracle fuzz as RandomizedFuzzVsBruteForce, but the
+    // alphabet includes '\0' so content and patterns exercise the byte-0 path.
+    std::mt19937 rng(4242);
+    const char alpha[] = {'\0', '\1', 'a', 'b'};  // small alphabet, '\0' frequent
+    for (int trial = 0; trial < 200; ++trial) {
+        size_t n = 1 + rng() % 300;
+        std::string text(n, 'a');
+        for (auto& ch : text) {
+            ch = alpha[rng() % 4];
+        }
+        uint32_t rate = 1 + rng() % 16;
+        FMIndex fm;
+        build1(fm, text, rate);
+        for (int q = 0; q < 20; ++q) {
+            size_t plen = 1 + rng() % 6;
+            std::string pat(plen, 'a');
+            for (auto& ch : pat) {
+                ch = alpha[rng() % 4];
+            }
+            CHECK_EQ(fm.Count(bytes(pat), plen), brute_count(text, pat));
+            CHECK_EQ(offsets(fm, pat), brute_positions(text, pat));
+        }
+    }
 }
 
 TEST(FMIndex, EmptyDocumentAmongNonEmpty) {
