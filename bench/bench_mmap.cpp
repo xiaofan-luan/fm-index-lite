@@ -74,15 +74,21 @@ main() {
     printf("mmap Open+LoadView  = %.1f ms\n", ms(t0, t1));
 
     printf("\n%-22s %-13s %-13s\n", "variant", "count_q/s", "batch_q/s");
-    printf("%-22s %-13.0f %-13.0f\n", "in-RAM (built)",
-           count_qps(ram, qs), batch_qps(ram, batch));
-    printf("%-22s %-13.0f %-13.0f\n", "Deserialize (copy)",
-           count_qps(de, qs), batch_qps(de, batch));
+    printf("%-22s %-13.0f %-13.0f\n",
+           "in-RAM (built)",
+           count_qps(ram, qs),
+           batch_qps(ram, batch));
+    printf("%-22s %-13.0f %-13.0f\n",
+           "Deserialize (copy)",
+           count_qps(de, qs),
+           batch_qps(de, batch));
     // cold: first query pass faults pages in
     double cold = count_qps(mapped->index(), qs);
     printf("%-22s %-13.0f (cold, page faults)\n", "mmap first pass", cold);
-    printf("%-22s %-13.0f %-13.0f\n", "mmap warm",
-           count_qps(mapped->index(), qs), batch_qps(mapped->index(), batch));
+    printf("%-22s %-13.0f %-13.0f\n",
+           "mmap warm",
+           count_qps(mapped->index(), qs),
+           batch_qps(mapped->index(), batch));
     std::remove("/tmp/fmidx_bench.fmix");
     return 0;
 }

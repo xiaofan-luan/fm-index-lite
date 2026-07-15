@@ -34,7 +34,7 @@ build_suffix_array(const std::vector<uint32_t>& s) {
     for (uint32_t v : s) {
         k = std::max(k, static_cast<int32_t>(v));
     }
-    ++k;  // alphabet size = max symbol + 1
+    ++k;                          // alphabet size = max symbol + 1
     const int32_t fs = 6 * 1024;  // recommended free space for performance
     std::vector<int32_t> saint(n + fs);
     int32_t rc =
@@ -57,7 +57,8 @@ build_suffix_array(const std::vector<uint32_t>& s) {
 inline std::vector<int32_t>
 build_suffix_array_symbols32(int32_t* t, size_t m, int32_t sigma) {
     if (m <= 1) {
-        return std::vector<int32_t>(m, 0);  // empty or lone-sentinel: SA=[0] or []
+        return std::vector<int32_t>(m,
+                                    0);  // empty or lone-sentinel: SA=[0] or []
     }
     const int32_t fs = 6 * 1024;  // recommended free space for performance
     std::vector<int32_t> sa(m + fs);

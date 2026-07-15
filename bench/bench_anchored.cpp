@@ -47,9 +47,10 @@ struct Corpus {
 static Corpus
 make_corpus(size_t ndocs, uint32_t seed) {
     std::mt19937 rng(seed);
-    static const char* alpha = "abcd";  // tiny alphabet -> tokens recur interior
-    const std::string pre = "log";      // shared 3-byte prefix token
-    const std::string suf = "log";      // shared 3-byte suffix token
+    static const char* alpha =
+        "abcd";                     // tiny alphabet -> tokens recur interior
+    const std::string pre = "log";  // shared 3-byte prefix token
+    const std::string suf = "log";  // shared 3-byte suffix token
     Corpus c;
     c.docs.reserve(ndocs);
     for (size_t i = 0; i < ndocs; ++i) {
@@ -93,7 +94,8 @@ old_prefix_docs(const FMIndex& fm, const std::string& p) {
 
 // OLD path: distinct docs that END with p, via locate-all-then-filter.
 static size_t
-old_suffix_docs(const FMIndex& fm, const std::string& p,
+old_suffix_docs(const FMIndex& fm,
+                const std::string& p,
                 const std::vector<uint32_t>& len) {
     auto hits = fm.LocateDocs(b(p), p.size());
     std::unordered_set<uint64_t> docs;
@@ -139,8 +141,10 @@ main(int argc, char** argv) {
     for (auto& d : c.docs) {
         bytes += d.size();
     }
-    fprintf(stderr, "corpus %.1f MB, building (sample_rate=%u)...\n",
-            bytes / 1e6, rate);
+    fprintf(stderr,
+            "corpus %.1f MB, building (sample_rate=%u)...\n",
+            bytes / 1e6,
+            rate);
     FMIndex fm;
     fm.Build(c.views, rate);
 
@@ -156,9 +160,17 @@ main(int argc, char** argv) {
     std::vector<std::string> queries = {"log", "logac", "aaa", "aab", "abc"};
 
     printf("# corpus=%zu docs (%.1f MB)  sample_rate=%u  budget=%.0fms/op\n",
-           ndocs, bytes / 1e6, rate, budget);
-    printf("# %-8s %-8s %10s %14s %14s %7s\n", "query", "op", "answer",
-           "OLD_q/s", "NEW_q/s", "speedup");
+           ndocs,
+           bytes / 1e6,
+           rate,
+           budget);
+    printf("# %-8s %-8s %10s %14s %14s %7s\n",
+           "query",
+           "op",
+           "answer",
+           "OLD_q/s",
+           "NEW_q/s",
+           "speedup");
 
     for (auto& q : queries) {
         size_t pc_new = fm.CountPrefixDocs(b(q), q.size());
@@ -171,29 +183,59 @@ main(int argc, char** argv) {
         size_t sc_old = old_suffix_docs(fm, q, c.len);
         if (pc_new != pc_old || sc_new != sc_old || pl_new != pc_old ||
             sl_new != sc_old) {
-            printf("!! MISMATCH q=%s prefix new=%zu old=%zu  suffix new=%zu old=%zu\n",
-                   q.c_str(), pc_new, pc_old, sc_new, sc_old);
+            printf(
+                "!! MISMATCH q=%s prefix new=%zu old=%zu  suffix new=%zu "
+                "old=%zu\n",
+                q.c_str(),
+                pc_new,
+                pc_old,
+                sc_new,
+                sc_old);
         }
 
         double pc_o = timed(budget, [&] { return old_prefix_docs(fm, q); });
-        double pc_n = timed(budget, [&] { return fm.CountPrefixDocs(b(q), q.size()); });
+        double pc_n =
+            timed(budget, [&] { return fm.CountPrefixDocs(b(q), q.size()); });
         double pl_o = timed(budget, [&] { return old_prefix_docs(fm, q); });
-        double pl_n =
-            timed(budget, [&] { return fm.LocatePrefixDocs(b(q), q.size()).size(); });
-        double sc_o = timed(budget, [&] { return old_suffix_docs(fm, q, c.len); });
-        double sc_n = timed(budget, [&] { return fm.CountSuffixDocs(b(q), q.size()); });
-        double sl_o = timed(budget, [&] { return old_suffix_docs(fm, q, c.len); });
-        double sl_n =
-            timed(budget, [&] { return fm.LocateSuffixDocs(b(q), q.size()).size(); });
+        double pl_n = timed(
+            budget, [&] { return fm.LocatePrefixDocs(b(q), q.size()).size(); });
+        double sc_o =
+            timed(budget, [&] { return old_suffix_docs(fm, q, c.len); });
+        double sc_n =
+            timed(budget, [&] { return fm.CountSuffixDocs(b(q), q.size()); });
+        double sl_o =
+            timed(budget, [&] { return old_suffix_docs(fm, q, c.len); });
+        double sl_n = timed(
+            budget, [&] { return fm.LocateSuffixDocs(b(q), q.size()).size(); });
 
-        printf("  %-8s %-8s %10zu %14.0f %14.0f %6.1fx\n", q.c_str(),
-               "pfxCount", pc_new, pc_o, pc_n, pc_n / pc_o);
-        printf("  %-8s %-8s %10zu %14.0f %14.0f %6.1fx\n", q.c_str(),
-               "pfxDocs", pl_new, pl_o, pl_n, pl_n / pl_o);
-        printf("  %-8s %-8s %10zu %14.0f %14.0f %6.1fx\n", q.c_str(),
-               "sfxCount", sc_new, sc_o, sc_n, sc_n / sc_o);
-        printf("  %-8s %-8s %10zu %14.0f %14.0f %6.1fx\n", q.c_str(),
-               "sfxDocs", sl_new, sl_o, sl_n, sl_n / sl_o);
+        printf("  %-8s %-8s %10zu %14.0f %14.0f %6.1fx\n",
+               q.c_str(),
+               "pfxCount",
+               pc_new,
+               pc_o,
+               pc_n,
+               pc_n / pc_o);
+        printf("  %-8s %-8s %10zu %14.0f %14.0f %6.1fx\n",
+               q.c_str(),
+               "pfxDocs",
+               pl_new,
+               pl_o,
+               pl_n,
+               pl_n / pl_o);
+        printf("  %-8s %-8s %10zu %14.0f %14.0f %6.1fx\n",
+               q.c_str(),
+               "sfxCount",
+               sc_new,
+               sc_o,
+               sc_n,
+               sc_n / sc_o);
+        printf("  %-8s %-8s %10zu %14.0f %14.0f %6.1fx\n",
+               q.c_str(),
+               "sfxDocs",
+               sl_new,
+               sl_o,
+               sl_n,
+               sl_n / sl_o);
     }
     return 0;
 }

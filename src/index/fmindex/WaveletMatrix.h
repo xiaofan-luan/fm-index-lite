@@ -169,7 +169,9 @@ class WaveletMatrix {
         return z_;
     }
     static WaveletMatrix
-    from_parts(size_t n, uint32_t levels, std::vector<BitVector> bv,
+    from_parts(size_t n,
+               uint32_t levels,
+               std::vector<BitVector> bv,
                std::vector<size_t> z) {
         WaveletMatrix wm;
         wm.n_ = n;

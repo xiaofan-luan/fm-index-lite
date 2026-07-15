@@ -50,34 +50,39 @@ run_all() {
         }
     }
     printf("\n%zu tests, %d checks, %d check-failures, %d failed tests\n",
-           registry().size(), checks(), failures(), failed_tests);
+           registry().size(),
+           checks(),
+           failures(),
+           failed_tests);
     return failed_tests == 0 ? 0 : 1;
 }
 
 }  // namespace simple_test
 
-#define TEST(suite, name)                                                    \
-    static void suite##_##name##_body();                                     \
-    static simple_test::Registrar suite##_##name##_reg(#suite "." #name,     \
+#define TEST(suite, name)                                                      \
+    static void suite##_##name##_body();                                       \
+    static simple_test::Registrar suite##_##name##_reg(#suite "." #name,       \
                                                        suite##_##name##_body); \
     static void suite##_##name##_body()
 
-#define CHECK(cond)                                                       \
-    do {                                                                  \
-        ++simple_test::checks();                                          \
-        if (!(cond)) {                                                    \
-            ++simple_test::failures();                                    \
-            printf("  CHECK failed: %s (%s:%d)\n", #cond, __FILE__,       \
-                   __LINE__);                                             \
-        }                                                                 \
+#define CHECK(cond)                                                            \
+    do {                                                                       \
+        ++simple_test::checks();                                               \
+        if (!(cond)) {                                                         \
+            ++simple_test::failures();                                         \
+            printf("  CHECK failed: %s (%s:%d)\n", #cond, __FILE__, __LINE__); \
+        }                                                                      \
     } while (0)
 
-#define CHECK_EQ(a, b)                                                     \
-    do {                                                                   \
-        ++simple_test::checks();                                          \
-        if (!((a) == (b))) {                                              \
-            ++simple_test::failures();                                    \
-            printf("  CHECK_EQ failed: %s == %s (%s:%d)\n", #a, #b,       \
-                   __FILE__, __LINE__);                                   \
-        }                                                                 \
+#define CHECK_EQ(a, b)                                      \
+    do {                                                    \
+        ++simple_test::checks();                            \
+        if (!((a) == (b))) {                                \
+            ++simple_test::failures();                      \
+            printf("  CHECK_EQ failed: %s == %s (%s:%d)\n", \
+                   #a,                                      \
+                   #b,                                      \
+                   __FILE__,                                \
+                   __LINE__);                               \
+        }                                                   \
     } while (0)

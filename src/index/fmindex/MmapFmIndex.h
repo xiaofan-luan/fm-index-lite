@@ -35,7 +35,7 @@ class MappedFMIndex {
         if (fd < 0) {
             return nullptr;
         }
-        struct stat st{};
+        struct stat st {};
         if (::fstat(fd, &st) != 0 || st.st_size <= 0) {
             ::close(fd);
             return nullptr;
@@ -50,8 +50,8 @@ class MappedFMIndex {
         self->fd_ = fd;
         self->addr_ = addr;
         self->size_ = sz;
-        self->index_ = FMIndex::LoadView(
-            reinterpret_cast<const uint8_t*>(addr), sz);
+        self->index_ =
+            FMIndex::LoadView(reinterpret_cast<const uint8_t*>(addr), sz);
         // A truncated / corrupt / wrong-version file yields an empty index that
         // silently answers 0 to every query. Surface that as an open failure
         // (the destructor unmaps) instead of handing back a dud.

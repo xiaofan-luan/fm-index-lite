@@ -1,5 +1,7 @@
 // Licensed to the LF AI & Data foundation under Apache-2.0.
 // Portions translated from Lance (lance_index::scalar::fmindex), Apache-2.0.
+// Header-only implementation of FMIndex (included at the bottom of FMIndex.h).
+#pragma once
 #include "index/fmindex/FMIndex.h"
 #include <algorithm>
 #include <cstdio>
@@ -13,12 +15,14 @@
 
 #ifdef FMIX_BUILD_MEM_PROFILE
 #include <sys/resource.h>
-#define FMIX_MEM(tag)                                                        \
-    do {                                                                     \
-        struct rusage ru;                                                    \
-        getrusage(RUSAGE_SELF, &ru);                                         \
-        std::fprintf(stderr, "  [mem] %-20s peak=%ld MB\n", tag,             \
-                     ru.ru_maxrss / (1024 * 1024));                          \
+#define FMIX_MEM(tag)                               \
+    do {                                            \
+        struct rusage ru;                           \
+        getrusage(RUSAGE_SELF, &ru);                \
+        std::fprintf(stderr,                        \
+                     "  [mem] %-20s peak=%ld MB\n", \
+                     tag,                           \
+                     ru.ru_maxrss / (1024 * 1024)); \
     } while (0)
 #else
 #define FMIX_MEM(tag) ((void)0)
@@ -26,9 +30,11 @@
 
 namespace milvus::index::fmindex {
 
-void
-FMIndex::Build(const std::vector<std::string_view>& docs, uint32_t sa_sample_rate,
-               bool case_insensitive, bool force_wide) {
+inline void
+FMIndex::Build(const std::vector<std::string_view>& docs,
+               uint32_t sa_sample_rate,
+               bool case_insensitive,
+               bool force_wide) {
     // Internal layout: each document's bytes are remapped to dense content ids,
     // and a separator symbol (dense id 1, OUTSIDE the byte alphabet) is injected
     // after each. That separator makes every query document-scoped: no query
@@ -84,7 +90,8 @@ FMIndex::Build(const std::vector<std::string_view>& docs, uint32_t sa_sample_rat
     }
     if (case_fold_) {
         for (int b = 'A'; b <= 'Z'; ++b) {
-            byte_to_id_[b] = byte_to_id_[b + 32];  // uppercase aliases lowercase
+            byte_to_id_[b] =
+                byte_to_id_[b + 32];  // uppercase aliases lowercase
         }
     }
     sigma_ = id;  // sentinel + separator + number of distinct content bytes
@@ -172,7 +179,8 @@ FMIndex::Build(const std::vector<std::string_view>& docs, uint32_t sa_sample_rat
     }
     samp.build_rank();
     sampled_bv_ = std::move(samp);
-    std::vector<int32_t>().swap(sa32);  // SA no longer needed — free before wavelet
+    std::vector<int32_t>().swap(
+        sa32);  // SA no longer needed — free before wavelet
     std::vector<int64_t>().swap(sa64);
     FMIX_MEM("after sampling");
 
@@ -188,7 +196,7 @@ FMIndex::Build(const std::vector<std::string_view>& docs, uint32_t sa_sample_rat
     buildDerived();
 }
 
-void
+inline void
 FMIndex::buildDerived() {
     // id -> byte (inverse of byte_to_id_). For a case-folded index both 'A' and
     // 'a' map to one id; ascending iteration lets lowercase win, so Extract
@@ -216,7 +224,7 @@ FMIndex::buildDerived() {
     }
 }
 
-std::string
+inline std::string
 FMIndex::Extract(uint64_t doc_id, uint64_t offset, size_t len) const {
     if (c_.empty() || doc_id + 1 >= doc_start_.size()) {
         return {};  // empty index or doc_id out of range
@@ -235,7 +243,8 @@ FMIndex::Extract(uint64_t doc_id, uint64_t offset, size_t len) const {
     // backward (LF) collecting BWT chars, which are the text bytes before each
     // row's suffix. Prefer the nearest sample above `end`; fall back to row 0
     // (the sentinel suffix, which starts at text_len_) when none exists.
-    uint64_t k = (end + sa_sample_rate_ - 1) / sa_sample_rate_;  // ceil(end/rate)
+    uint64_t k =
+        (end + sa_sample_rate_ - 1) / sa_sample_rate_;  // ceil(end/rate)
     size_t row;
     uint64_t p;
     if (k < isa_sample_.size()) {
@@ -258,7 +267,7 @@ FMIndex::Extract(uint64_t doc_id, uint64_t offset, size_t len) const {
     return out;
 }
 
-FMIndex::LongestMatchResult
+inline FMIndex::LongestMatchResult
 FMIndex::LongestMatch(const uint8_t* query, size_t qlen) const {
     LongestMatchResult best{0, 0, 0};
     if (c_.empty()) {
@@ -293,7 +302,7 @@ FMIndex::LongestMatch(const uint8_t* query, size_t qlen) const {
     return best;
 }
 
-std::vector<std::pair<uint8_t, size_t>>
+inline std::vector<std::pair<uint8_t, size_t>>
 FMIndex::NextTokenCounts(const uint8_t* pattern, size_t plen) const {
     std::vector<std::pair<uint8_t, size_t>> out;
     if (c_.empty()) {
@@ -321,9 +330,10 @@ FMIndex::NextTokenCounts(const uint8_t* pattern, size_t plen) const {
     return out;
 }
 
-std::vector<uint64_t>
+inline std::vector<uint64_t>
 FMIndex::MatchingDocs(const uint8_t* pat, size_t plen) const {
-    auto hits = LocateDocs(pat, plen);  // (doc, offset), cross-doc seam filtered
+    auto hits =
+        LocateDocs(pat, plen);  // (doc, offset), cross-doc seam filtered
     std::vector<uint64_t> docs;
     docs.reserve(hits.size());
     for (auto& h : hits) {
@@ -333,7 +343,7 @@ FMIndex::MatchingDocs(const uint8_t* pat, size_t plen) const {
     return docs;
 }
 
-std::vector<uint64_t>
+inline std::vector<uint64_t>
 FMIndex::FuzzyMatchingDocs(const uint8_t* pat, size_t plen, uint32_t k) const {
     if (c_.empty() || plen == 0) {
         return {};
@@ -420,13 +430,13 @@ FMIndex::FuzzyMatchingDocs(const uint8_t* pat, size_t plen, uint32_t k) const {
     return {docset.begin(), docset.end()};
 }
 
-size_t
+inline size_t
 FMIndex::LF(size_t i) const {
     uint32_t sym = wm_.access(i);
     return c_[sym] + wm_.rank(sym, i);
 }
 
-std::pair<size_t, size_t>
+inline std::pair<size_t, size_t>
 FMIndex::BackwardSearch(const uint8_t* pattern, size_t plen) const {
     if (c_.empty()) {
         return {0, 0};  // default-constructed / failed-Deserialize index
@@ -452,7 +462,7 @@ FMIndex::BackwardSearch(const uint8_t* pattern, size_t plen) const {
     return {lo, hi};
 }
 
-std::vector<size_t>
+inline std::vector<size_t>
 FMIndex::CountBatch(
     const std::vector<std::pair<const uint8_t*, size_t>>& patterns) const {
     const size_t m = text_len_ + 1;
@@ -531,13 +541,14 @@ FMIndex::CountBatch(
     return result;
 }
 
-uint64_t
+inline uint64_t
 FMIndex::docOf(uint64_t internal_pos) const {
-    auto it = std::upper_bound(doc_start_.begin(), doc_start_.end(), internal_pos);
+    auto it =
+        std::upper_bound(doc_start_.begin(), doc_start_.end(), internal_pos);
     return static_cast<uint64_t>(it - doc_start_.begin()) - 1;
 }
 
-uint64_t
+inline uint64_t
 FMIndex::locateRow(size_t row) const {
     uint64_t steps = 0;
     while (!sampled_bv_.get(row)) {
@@ -547,11 +558,11 @@ FMIndex::locateRow(size_t row) const {
     return sa_sample_vals_[sampled_bv_.rank1(row)] + steps;
 }
 
-std::vector<uint64_t>
+inline std::vector<uint64_t>
 FMIndex::locateInternal(const uint8_t* pattern, size_t plen) const {
     if (plen == 0) {
         return {};  // empty pattern: no document-scoped hits (matches
-                    // FuzzyMatchingDocs); a raw Count still reports m positions.
+            // FuzzyMatchingDocs); a raw Count still reports m positions.
     }
     auto r = BackwardSearch(pattern, plen);
     std::vector<uint64_t> out;
@@ -565,7 +576,7 @@ FMIndex::locateInternal(const uint8_t* pattern, size_t plen) const {
     return out;
 }
 
-std::vector<std::pair<uint64_t, uint64_t>>
+inline std::vector<std::pair<uint64_t, uint64_t>>
 FMIndex::LocateDocs(const uint8_t* pattern, size_t plen) const {
     std::vector<uint64_t> positions = locateInternal(pattern, plen);
     std::vector<std::pair<uint64_t, uint64_t>> out;
@@ -581,7 +592,7 @@ FMIndex::LocateDocs(const uint8_t* pattern, size_t plen) const {
     return out;
 }
 
-std::vector<std::vector<std::pair<uint64_t, uint64_t>>>
+inline std::vector<std::vector<std::pair<uint64_t, uint64_t>>>
 FMIndex::LocateDocsBatch(
     const std::vector<std::pair<const uint8_t*, size_t>>& patterns) const {
     const size_t B = patterns.size();
@@ -673,7 +684,7 @@ FMIndex::LocateDocsBatch(
     return out;
 }
 
-size_t
+inline size_t
 FMIndex::CountPrefixDocs(const uint8_t* pattern, size_t plen) const {
     if (plen == 0 || c_.empty()) {
         return 0;
@@ -691,7 +702,7 @@ FMIndex::CountPrefixDocs(const uint8_t* pattern, size_t plen) const {
     return at_hi - at_lo;
 }
 
-std::vector<uint64_t>
+inline std::vector<uint64_t>
 FMIndex::LocatePrefixDocs(const uint8_t* pattern, size_t plen) const {
     if (plen == 0 || c_.empty()) {
         return {};
@@ -726,7 +737,7 @@ FMIndex::LocatePrefixDocs(const uint8_t* pattern, size_t plen) const {
     return docs;
 }
 
-std::pair<size_t, size_t>
+inline std::pair<size_t, size_t>
 FMIndex::suffixDocInterval(const uint8_t* pattern, size_t plen) const {
     if (plen == 0 || c_.empty()) {
         return {0, 0};
@@ -754,13 +765,13 @@ FMIndex::suffixDocInterval(const uint8_t* pattern, size_t plen) const {
     return {lo, hi};
 }
 
-size_t
+inline size_t
 FMIndex::CountSuffixDocs(const uint8_t* pattern, size_t plen) const {
     auto r = suffixDocInterval(pattern, plen);
     return r.second - r.first;  // each row is a distinct document ending in P
 }
 
-std::vector<uint64_t>
+inline std::vector<uint64_t>
 FMIndex::LocateSuffixDocs(const uint8_t* pattern, size_t plen) const {
     auto r = suffixDocInterval(pattern, plen);
     std::vector<uint64_t> docs;
@@ -782,7 +793,6 @@ FMIndex::LocateSuffixDocs(const uint8_t* pattern, size_t plen) const {
 // arrays each padded to an 8-byte boundary so LoadView can point at them
 // (zero-copy) from mmap'd memory. Only the wavelet/sampled word arrays are
 // viewed; the small sample/doc arrays are copied on load either way.
-namespace {
 template <typename T>
 void
 put(std::string& s, const T& v) {
@@ -803,9 +813,8 @@ constexpr uint32_t kMagic = 0x464D4958;  // "FMIX"
 // v7: separator is an out-of-byte-alphabet symbol (dense id 1), so '\0' is
 // ordinary content; content ids are 2..sigma. Not backward-compatible with v6.
 constexpr uint32_t kFormatVersion = 7;
-}  // namespace
 
-void
+inline void
 FMIndex::writeHeader(std::string& s) const {
     put(s, kMagic);
     put(s, kFormatVersion);
@@ -814,8 +823,9 @@ FMIndex::writeHeader(std::string& s) const {
     put(s, qlevels_);
     // Flags live in the former 4-byte alignment pad (keeps text_len 8-aligned):
     // bit 0 = ASCII case-insensitive, bit 1 = 8-byte sampled-SA storage.
-    put(s, static_cast<uint32_t>((case_fold_ ? 1u : 0u) |
-                                 (wide_storage_ ? 2u : 0u)));
+    put(s,
+        static_cast<uint32_t>((case_fold_ ? 1u : 0u) |
+                              (wide_storage_ ? 2u : 0u)));
     put(s, text_len_);
     for (int32_t v : byte_to_id_) {
         put(s, v);
@@ -837,7 +847,7 @@ FMIndex::writeHeader(std::string& s) const {
     put(s, static_cast<uint64_t>(doc_start_.size()));
 }
 
-std::string
+inline std::string
 FMIndex::Serialize() const {
     std::string s;
     writeHeader(s);
@@ -871,7 +881,7 @@ FMIndex::Serialize() const {
     return s;
 }
 
-bool
+inline bool
 FMIndex::SerializeToFile(const std::string& path) const {
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) {
@@ -914,7 +924,7 @@ FMIndex::SerializeToFile(const std::string& path) const {
     return ok;
 }
 
-bool
+inline bool
 FMIndex::parseView(const uint8_t* base, size_t size) {
     const char* p = reinterpret_cast<const char*>(base);
     const char* end = p + size;
@@ -980,8 +990,8 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         // The payload section sizes are fully determined by m; reject any blob
         // whose declared counts don't match (a mutated size would otherwise
         // drive align_view / from_view to read past the mapping).
-        const uint64_t exp_qnw = (m + 31) / 32;   // 2-bit symbols, 32 per word
-        const uint64_t exp_snw = (m + 63) / 64;   // 1-bit rows, 64 per word
+        const uint64_t exp_qnw = (m + 31) / 32;  // 2-bit symbols, 32 per word
+        const uint64_t exp_snw = (m + 63) / 64;  // 1-bit rows, 64 per word
         for (uint32_t l = 0; l < qlevels_; ++l) {
             if (qnw[l] != exp_qnw) {
                 return false;
@@ -992,8 +1002,8 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
             return false;
         }
         auto align_view = [&](uint64_t nbytes) -> const uint64_t* {
-            size_t off = static_cast<size_t>(p - reinterpret_cast<const char*>(
-                                                     base));
+            size_t off =
+                static_cast<size_t>(p - reinterpret_cast<const char*>(base));
             size_t pad = (8 - (off & 7u)) & 7u;
             if (p + pad + nbytes > end) {
                 throw std::runtime_error("fmindex: truncated payload");
@@ -1024,8 +1034,8 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
                 return false;
             }
         }
-        wm_ = WaveletMatrix4::from_parts(m, qlevels_, std::move(qvs),
-                                         std::move(starts));
+        wm_ = WaveletMatrix4::from_parts(
+            m, qlevels_, std::move(qvs), std::move(starts));
         first_.resize(sigma_);
         for (uint32_t c = 0; c < sigma_; ++c) {
             first_[c] = wm_.map_zero(c);
@@ -1042,8 +1052,8 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         const uint64_t* svp = align_view(n_samples * pw);
         sa_sample_vals_.resize(n_samples);
         if (pw == 8) {
-            std::memcpy(sa_sample_vals_.data(), svp,
-                        n_samples * sizeof(uint64_t));
+            std::memcpy(
+                sa_sample_vals_.data(), svp, n_samples * sizeof(uint64_t));
         } else {
             const uint32_t* s32 = reinterpret_cast<const uint32_t*>(svp);
             for (uint64_t i = 0; i < n_samples; ++i) {
@@ -1079,7 +1089,7 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
     }
 }
 
-FMIndex
+inline FMIndex
 FMIndex::LoadView(const uint8_t* base, size_t size) {
     FMIndex fm;
     if (!fm.parseView(base, size)) {
@@ -1088,7 +1098,7 @@ FMIndex::LoadView(const uint8_t* base, size_t size) {
     return fm;
 }
 
-FMIndex
+inline FMIndex
 FMIndex::Deserialize(const std::string& blob) {
     FMIndex fm;
     fm.owned_blob_.assign(blob.begin(), blob.end());

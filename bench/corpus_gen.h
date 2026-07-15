@@ -38,8 +38,7 @@ make_corpus(size_t n, int kind, uint32_t seed) {
 
 // Random existing substrings (guaranteed matches) of length L.
 inline std::vector<std::string>
-make_queries(const std::string& corpus, size_t count, size_t L,
-             uint32_t seed) {
+make_queries(const std::string& corpus, size_t count, size_t L, uint32_t seed) {
     std::mt19937 rng(seed);
     std::vector<std::string> qs;
     qs.reserve(count);

@@ -38,12 +38,13 @@ peak_rss_mb() {
 
 int
 main(int argc, char** argv) {
-    const size_t target = (argc > 1 ? std::stoull(argv[1]) : 1) * (size_t(1) << 30);
+    const size_t target =
+        (argc > 1 ? std::stoull(argv[1]) : 1) * (size_t(1) << 30);
     const size_t doc_len = 1024;  // ~1 KiB documents (rows)
 
     // ---- generate word-like documents totalling ~target bytes ----
-    fprintf(stderr, "generating ~%.2f GiB corpus...\n",
-            target / double(1 << 30));
+    fprintf(
+        stderr, "generating ~%.2f GiB corpus...\n", target / double(1 << 30));
     std::mt19937 rng(42);
     static const char* alpha = "abcdefghijklmnopqrstuvwxyz";
     std::vector<std::string> docs;
@@ -56,13 +57,16 @@ main(int argc, char** argv) {
             size_t wlen = 2 + rng() % 8;
             for (size_t i = 0; i < wlen && d.size() < doc_len; ++i)
                 d.push_back(alpha[rng() % 26]);
-            if (d.size() < doc_len) d.push_back(' ');
+            if (d.size() < doc_len)
+                d.push_back(' ');
         }
         total += d.size();
         docs.push_back(std::move(d));
     }
     std::vector<std::string_view> views(docs.begin(), docs.end());
-    fprintf(stderr, "  %zu docs, %.3f GiB total\n", docs.size(),
+    fprintf(stderr,
+            "  %zu docs, %.3f GiB total\n",
+            docs.size(),
             total / double(1 << 30));
 
     // ---- build ----
@@ -73,7 +77,8 @@ main(int argc, char** argv) {
     double build_ms = ms_since(t0);
     double rss_after = peak_rss_mb();
     printf("BUILD   %.1f s   peak RSS %.2f GB (%.1fx corpus)\n",
-           build_ms / 1000.0, rss_after / 1024.0,
+           build_ms / 1000.0,
+           rss_after / 1024.0,
            rss_after * 1024.0 * 1024.0 / total);
 
     // ---- on-disk index size (streamed, no full in-RAM blob) ----
@@ -84,10 +89,15 @@ main(int argc, char** argv) {
     size_t idx_bytes = 0;
     if (ok) {
         FILE* f = std::fopen(path.c_str(), "rb");
-        if (f) { std::fseek(f, 0, SEEK_END); idx_bytes = std::ftell(f); std::fclose(f); }
+        if (f) {
+            std::fseek(f, 0, SEEK_END);
+            idx_bytes = std::ftell(f);
+            std::fclose(f);
+        }
     }
     printf("INDEX   %.2f GB on disk (%.2fx corpus)   serialize %.1f s\n",
-           idx_bytes / double(1 << 30), double(idx_bytes) / total,
+           idx_bytes / double(1 << 30),
+           double(idx_bytes) / total,
            ser_ms / 1000.0);
     std::remove(path.c_str());
 
@@ -108,7 +118,8 @@ main(int argc, char** argv) {
     for (auto& q : qs) occ += fm.Count(B(q), q.size());
     double count_ms = ms_since(t0);
     printf("COUNT   %.2f us/query   %.0f qps   (%llu total occ)\n",
-           count_ms * 1000.0 / NQ, NQ / (count_ms / 1000.0),
+           count_ms * 1000.0 / NQ,
+           NQ / (count_ms / 1000.0),
            (unsigned long long)occ);
 
     // CountBatch (bulk)
@@ -121,7 +132,8 @@ main(int argc, char** argv) {
     uint64_t bsum = 0;
     for (size_t v : bres) bsum += v;
     printf("BATCH   %.2f us/query   %.0f qps   %s\n",
-           batch_ms * 1000.0 / NQ, NQ / (batch_ms / 1000.0),
+           batch_ms * 1000.0 / NQ,
+           NQ / (batch_ms / 1000.0),
            bsum == occ ? "(matches Count)" : "(MISMATCH!)");
 
     // LocateDocs / MatchingDocs on a subset (heavier: LF walks per hit)
@@ -132,7 +144,8 @@ main(int argc, char** argv) {
         lhits += fm.LocateDocs(B(qs[i]), qs[i].size()).size();
     double loc_ms = ms_since(t0);
     printf("LOCDOCS %.2f us/query   %.0f qps   (%llu hits)\n",
-           loc_ms * 1000.0 / NL, NL / (loc_ms / 1000.0),
+           loc_ms * 1000.0 / NL,
+           NL / (loc_ms / 1000.0),
            (unsigned long long)lhits);
 
     t0 = clk::now();
@@ -141,7 +154,8 @@ main(int argc, char** argv) {
         mdocs += fm.MatchingDocs(B(qs[i]), qs[i].size()).size();
     double md_ms = ms_since(t0);
     printf("MATCHDOC %.2f us/query  %.0f qps   (%llu docs)\n",
-           md_ms * 1000.0 / NL, NL / (md_ms / 1000.0),
+           md_ms * 1000.0 / NL,
+           NL / (md_ms / 1000.0),
            (unsigned long long)mdocs);
 
     // FuzzyMatchingDocs k=1 on a small subset (backtracking, much heavier)
@@ -152,7 +166,9 @@ main(int argc, char** argv) {
         fdocs += fm.FuzzyMatchingDocs(B(qs[i]), qs[i].size(), 1).size();
     double f_ms = ms_since(t0);
     printf("FUZZY-1 %.2f ms/query   %.0f qps   (%llu docs)\n",
-           f_ms / NF, NF / (f_ms / 1000.0), (unsigned long long)fdocs);
+           f_ms / NF,
+           NF / (f_ms / 1000.0),
+           (unsigned long long)fdocs);
 
     // Extract a document window
     t0 = clk::now();
@@ -162,7 +178,9 @@ main(int argc, char** argv) {
         echk += fm.Extract(i % docs.size(), 0, 64).size();
     double e_ms = ms_since(t0);
     printf("EXTRACT %.2f us/call    %.0f qps   (%zu bytes)\n",
-           e_ms * 1000.0 / NE, NE / (e_ms / 1000.0), echk);
+           e_ms * 1000.0 / NE,
+           NE / (e_ms / 1000.0),
+           echk);
 
     printf("\n(rss_before=%.0f MB)\n", rss_before);
     return 0;

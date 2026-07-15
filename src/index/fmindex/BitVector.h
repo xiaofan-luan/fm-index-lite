@@ -15,8 +15,7 @@ class BitVector {
     BitVector() = default;
 
     // Owning builder: allocate zeroed words, fill via set(), then build_rank().
-    explicit BitVector(size_t n)
-        : n_(n), owned_words_((n + 63) / 64, 0ULL) {
+    explicit BitVector(size_t n) : n_(n), owned_words_((n + 63) / 64, 0ULL) {
         words_ = owned_words_.data();
         nwords_ = owned_words_.size();
     }

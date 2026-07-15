@@ -61,7 +61,8 @@ class FMIndex {
     //                   identical either way.
     void
     Build(const std::vector<std::string_view>& docs,
-          uint32_t sa_sample_rate = 32, bool case_insensitive = false,
+          uint32_t sa_sample_rate = 32,
+          bool case_insensitive = false,
           bool force_wide = false);
 
     // Half-open SA interval [lo, hi) for pattern; lo==hi means no match.
@@ -79,8 +80,8 @@ class FMIndex {
     // misses overlap (memory-level parallelism) — far higher throughput than
     // calling Count() in a loop. Result[i] corresponds to patterns[i].
     std::vector<size_t>
-    CountBatch(const std::vector<std::pair<const uint8_t*, size_t>>& patterns)
-        const;
+    CountBatch(
+        const std::vector<std::pair<const uint8_t*, size_t>>& patterns) const;
 
     // Sorted (doc_id, offset_within_doc) of every occurrence. Because documents
     // are separator-delimited internally, no occurrence can span two documents, so
@@ -141,9 +142,9 @@ class FMIndex {
     // length == 0 means no single query byte occurs.
     // O(qlen * match_length) — intended for query-sized inputs.
     struct LongestMatchResult {
-        size_t length;      // length of the longest matching substring
-        size_t query_pos;   // its start offset within `query`
-        size_t count;       // number of occurrences in the corpus
+        size_t length;     // length of the longest matching substring
+        size_t query_pos;  // its start offset within `query`
+        size_t count;      // number of occurrences in the corpus
     };
     LongestMatchResult
     LongestMatch(const uint8_t* query, size_t qlen) const;
@@ -275,20 +276,21 @@ class FMIndex {
     writeHeader(std::string& s) const;
 
     uint32_t sa_sample_rate_ = 1;
-    bool case_fold_ = false;             // ASCII A-Z folded to a-z at build time
-    bool wide_storage_ = false;          // sampled-SA positions stored 8B (>=4GiB)
-    uint64_t text_len_ = 0;              // INTERNAL length incl. separators, no sentinel
-    uint32_t sigma_ = 2;                 // dense alphabet size (incl. sentinel + separator)
-    uint32_t qlevels_ = 0;              // ceil(ceil(log2(sigma_)) / 2)
+    bool case_fold_ = false;     // ASCII A-Z folded to a-z at build time
+    bool wide_storage_ = false;  // sampled-SA positions stored 8B (>=4GiB)
+    uint64_t text_len_ = 0;  // INTERNAL length incl. separators, no sentinel
+    uint32_t sigma_ = 2;     // dense alphabet size (incl. sentinel + separator)
+    uint32_t qlevels_ = 0;   // ceil(ceil(log2(sigma_)) / 2)
     // byte -> dense content id in [2, sigma), or -1 if the byte is absent from
     // the corpus. Ids 0 (sentinel) and 1 (separator) are never byte ids, so no
     // query byte can address the separator — that is what keeps '\0' queryable
     // as content while cross-document matches remain impossible.
     std::array<int32_t, 256> byte_to_id_{};
-    WaveletMatrix4 wm_;                 // 4-ary quad matrix over the BWT
-    std::vector<uint64_t> c_;           // C-table, size sigma_ (counts up to len)
-    std::vector<size_t> first_;         // per-symbol map_zero (derived, not serialized)
-    BitVector sampled_bv_;              // row is SA-sampled? rank = sample index
+    WaveletMatrix4 wm_;        // 4-ary quad matrix over the BWT
+    std::vector<uint64_t> c_;  // C-table, size sigma_ (counts up to len)
+    std::vector<size_t>
+        first_;             // per-symbol map_zero (derived, not serialized)
+    BitVector sampled_bv_;  // row is SA-sampled? rank = sample index
     // SA values of sampled rows, in row order. Held as uint64 in RAM; serialized
     // at 4 bytes when len < 2^32, else 8 (so small corpora keep the small index).
     std::vector<uint64_t> sa_sample_vals_;
@@ -297,11 +299,20 @@ class FMIndex {
     // = text_len_. Doc d's content is [doc_start_[d], doc_start_[d+1]-1) with the
     // separator symbol at doc_start_[d+1]-1.
     std::vector<uint64_t> doc_start_;
-    int32_t sep_id_ = 1;  // dense id of the separator symbol (constant; not a byte)
+    int32_t sep_id_ =
+        1;  // dense id of the separator symbol (constant; not a byte)
     // Derived, in-RAM only (rebuilt on load, never serialized):
-    std::vector<uint8_t> id_to_byte_;    // dense id -> byte (inverse of byte_to_id_)
-    std::vector<uint64_t> isa_sample_;   // isa_sample_[k] = row whose SA value = k*rate
-    std::vector<uint8_t> owned_blob_;  // backs the views when Deserialized by copy
+    std::vector<uint8_t>
+        id_to_byte_;  // dense id -> byte (inverse of byte_to_id_)
+    std::vector<uint64_t>
+        isa_sample_;  // isa_sample_[k] = row whose SA value = k*rate
+    std::vector<uint8_t>
+        owned_blob_;  // backs the views when Deserialized by copy
 };
 
 }  // namespace milvus::index::fmindex
+
+// Header-only: the out-of-line member definitions live in FMIndexInl.h, included
+// here so that including FMIndex.h alone provides the full implementation. The
+// self-include of FMIndex.h inside FMIndexInl.h is a no-op via the include guard.
+#include "index/fmindex/FMIndexInl.h"

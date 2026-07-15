@@ -35,11 +35,19 @@ main(int argc, char** argv) {
     }
     const std::vector<uint32_t> sample_rates = {4, 32};
 
-    printf("%-6s %-9s %-5s %-11s %-10s %-7s %-12s %-12s %-12s\n", "kind",
-           "corpus", "rate", "build_ms", "idx_MB", "ratio", "count_q/s",
-           "batch_q/s", "locate_q/s");
-    printf("RESULT\tkind\tcorpus_bytes\tsample_rate\tbuild_ms\tindex_bytes\t"
-           "ratio\tcount_qps\tlocate_qps\ttotal_occ\n");
+    printf("%-6s %-9s %-5s %-11s %-10s %-7s %-12s %-12s %-12s\n",
+           "kind",
+           "corpus",
+           "rate",
+           "build_ms",
+           "idx_MB",
+           "ratio",
+           "count_q/s",
+           "batch_q/s",
+           "locate_q/s");
+    printf(
+        "RESULT\tkind\tcorpus_bytes\tsample_rate\tbuild_ms\tindex_bytes\t"
+        "ratio\tcount_qps\tlocate_qps\ttotal_occ\n");
 
     std::ofstream results("results_ours.txt");
 
@@ -48,9 +56,10 @@ main(int argc, char** argv) {
         for (size_t n : sizes) {
             std::string corpus =
                 fmbench::make_corpus(n, kind, fmbench::kCorpusSeed);
-            auto queries = fmbench::make_queries(
-                corpus, fmbench::kQueryCount, fmbench::kQueryLen,
-                fmbench::kQuerySeed);
+            auto queries = fmbench::make_queries(corpus,
+                                                 fmbench::kQueryCount,
+                                                 fmbench::kQueryLen,
+                                                 fmbench::kQuerySeed);
             for (uint32_t rate : sample_rates) {
                 FMIndex fm;
                 auto t0 = clk::now();
@@ -88,7 +97,8 @@ main(int argc, char** argv) {
                 t0 = clk::now();
                 for (size_t i = 0; i < LN; ++i) {
                     volatile auto sz =
-                        fm.LocateDocs(bytes(queries[i]), queries[i].size()).size();
+                        fm.LocateDocs(bytes(queries[i]), queries[i].size())
+                            .size();
                     (void)sz;
                 }
                 double locate_qps = LN / (ms_since(t0) / 1000.0);
@@ -96,11 +106,26 @@ main(int argc, char** argv) {
                 printf(
                     "%-6s %-9zu %-5u %-11.1f %-10.3f %-7.3f %-12.0f %-12.0f "
                     "%-12.0f\n",
-                    kname, n, rate, build_ms, blob.size() / (1024.0 * 1024.0),
-                    ratio, count_qps, batch_qps, locate_qps);
-                printf("RESULT\t%s\t%zu\t%u\t%.1f\t%zu\t%.4f\t%.0f\t%.0f\t%llu\n",
-                       kname, n, rate, build_ms, blob.size(), ratio, count_qps,
-                       locate_qps, (unsigned long long)total_occ);
+                    kname,
+                    n,
+                    rate,
+                    build_ms,
+                    blob.size() / (1024.0 * 1024.0),
+                    ratio,
+                    count_qps,
+                    batch_qps,
+                    locate_qps);
+                printf(
+                    "RESULT\t%s\t%zu\t%u\t%.1f\t%zu\t%.4f\t%.0f\t%.0f\t%llu\n",
+                    kname,
+                    n,
+                    rate,
+                    build_ms,
+                    blob.size(),
+                    ratio,
+                    count_qps,
+                    locate_qps,
+                    (unsigned long long)total_occ);
             }
             // result dump for diffing (counts are sample-rate-independent)
             FMIndex fm;

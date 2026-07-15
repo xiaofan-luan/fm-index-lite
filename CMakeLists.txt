@@ -39,8 +39,10 @@ option(FMINDEX_OPENMP "Parallel suffix-array build via libsais OpenMP" OFF)
 include_directories(${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}
                     ${CMAKE_SOURCE_DIR}/third_party/libsais)
 
+# FMIndex is now header-only (implementation in FMIndexInl.h, included by
+# FMIndex.h). This target carries only the vendored libsais C sources that the
+# header calls into; consumers include the headers and link this for libsais.
 add_library(fmindex STATIC
-    src/index/fmindex/FMIndex.cpp
     third_party/libsais/libsais.c
     third_party/libsais/libsais64.c)  # int64 SA for corpora >= 2 GiB
 

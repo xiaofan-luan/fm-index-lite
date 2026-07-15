@@ -45,8 +45,8 @@ class WaveletMatrix4 {
             start_[l][3] = hist[0] + hist[1] + hist[2];
             // Stable counting-sort scatter cur -> next by digit (prefix-sum
             // cursors preserve within-group order), then ping-pong.
-            std::array<size_t, 4> off{start_[l][0], start_[l][1], start_[l][2],
-                                      start_[l][3]};
+            std::array<size_t, 4> off{
+                start_[l][0], start_[l][1], start_[l][2], start_[l][3]};
             for (size_t i = 0; i < n_; ++i) {
                 next[off[digits[i]]++] = cur[i];
             }
@@ -145,7 +145,9 @@ class WaveletMatrix4 {
         return start_;
     }
     static WaveletMatrix4
-    from_parts(size_t n, uint32_t qlevels, std::vector<QuadVector> qv,
+    from_parts(size_t n,
+               uint32_t qlevels,
+               std::vector<QuadVector> qv,
                std::vector<std::array<size_t, 4>> start) {
         WaveletMatrix4 wm;
         wm.n_ = n;
