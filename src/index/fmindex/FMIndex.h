@@ -103,22 +103,24 @@ class FMIndex {
     // start boundary.
     std::vector<uint64_t>
     LocatePrefixDocs(const uint8_t* pattern, size_t plen) const;
-    // Number of documents that begin with the pattern.
+    // Number of documents that begin with the pattern. O(|pattern|): an
+    // occurrence sits on a document start iff its preceding BWT symbol is the
+    // sentinel or the separator, so the answer is a single rank difference over
+    // the pattern's SA interval — no suffix-array locate at all.
     size_t
-    CountPrefixDocs(const uint8_t* pattern, size_t plen) const {
-        return LocatePrefixDocs(pattern, plen).size();
-    }
+    CountPrefixDocs(const uint8_t* pattern, size_t plen) const;
 
     // Documents that END with the pattern (anchored suffix match), as sorted,
     // unique document ids. A hit is an occurrence whose end (pos + plen) lands
     // exactly on the document's end boundary.
     std::vector<uint64_t>
     LocateSuffixDocs(const uint8_t* pattern, size_t plen) const;
-    // Number of documents that end with the pattern.
+    // Number of documents that end with the pattern. O(|pattern|): the documents
+    // ending with P are exactly the occurrences of "P<separator>", so a backward
+    // search seeded on the separator interval yields the answer as the width of
+    // the resulting SA interval — no suffix-array locate at all.
     size_t
-    CountSuffixDocs(const uint8_t* pattern, size_t plen) const {
-        return LocateSuffixDocs(pattern, plen).size();
-    }
+    CountSuffixDocs(const uint8_t* pattern, size_t plen) const;
 
     // Recover the original bytes of document `doc_id`, T[offset, offset+len)
     // within that document — e.g. to show the context around a match from
@@ -238,6 +240,12 @@ class FMIndex {
  private:
     size_t
     LF(size_t i) const;
+    // Internal SA position of a single BWT row: walk LF until a sampled row, then
+    // add the steps. The per-row core shared by locateInternal and the anchored
+    // prefix/suffix locators (which locate only the boundary rows, not all
+    // occurrences). Caller guarantees the row is a genuine content occurrence.
+    uint64_t
+    locateRow(size_t row) const;
     // SA positions (internal, separator-injected coordinates) of every
     // occurrence, sorted. Shared by Locate / LocateDocs / prefix / suffix.
     std::vector<uint64_t>
@@ -245,6 +253,13 @@ class FMIndex {
     // Document id whose internal range contains internal position p.
     uint64_t
     docOf(uint64_t internal_pos) const;
+    // Half-open SA interval of "pattern<separator>" — the occurrences of the
+    // pattern immediately followed by a document separator, i.e. exactly the
+    // document-END occurrences. Seeds a backward search on the separator's SA
+    // interval and extends it by the pattern. Empty (lo==hi) means no document
+    // ends with the pattern. Shared by CountSuffixDocs / LocateSuffixDocs.
+    std::pair<size_t, size_t>
+    suffixDocInterval(const uint8_t* pattern, size_t plen) const;
     // Rebuild the in-RAM-only structures derived from the serialized fields:
     // id_to_byte_ (from byte_to_id_) and isa_sample_ (from sampled_bv_ +
     // sa_sample_vals_). Called after Build and after a load.

@@ -537,6 +537,16 @@ FMIndex::docOf(uint64_t internal_pos) const {
     return static_cast<uint64_t>(it - doc_start_.begin()) - 1;
 }
 
+uint64_t
+FMIndex::locateRow(size_t row) const {
+    uint64_t steps = 0;
+    while (!sampled_bv_.get(row)) {
+        row = LF(row);
+        ++steps;
+    }
+    return sa_sample_vals_[sampled_bv_.rank1(row)] + steps;
+}
+
 std::vector<uint64_t>
 FMIndex::locateInternal(const uint8_t* pattern, size_t plen) const {
     if (plen == 0) {
@@ -546,13 +556,7 @@ FMIndex::locateInternal(const uint8_t* pattern, size_t plen) const {
     auto r = BackwardSearch(pattern, plen);
     std::vector<uint64_t> out;
     for (size_t i = r.first; i < r.second; ++i) {
-        size_t row = i;
-        uint64_t steps = 0;
-        while (!sampled_bv_.get(row)) {
-            row = LF(row);
-            ++steps;
-        }
-        uint64_t pos = sa_sample_vals_[sampled_bv_.rank1(row)] + steps;
+        uint64_t pos = locateRow(i);
         if (pos < text_len_) {
             out.push_back(pos);  // internal coordinate (separators included)
         }
@@ -669,39 +673,104 @@ FMIndex::LocateDocsBatch(
     return out;
 }
 
+size_t
+FMIndex::CountPrefixDocs(const uint8_t* pattern, size_t plen) const {
+    if (plen == 0 || c_.empty()) {
+        return 0;
+    }
+    auto r = BackwardSearch(pattern, plen);
+    if (r.first >= r.second) {
+        return 0;
+    }
+    // An occurrence sits on a document start iff the BWT symbol preceding it is
+    // the sentinel (id 0, before doc 0) or a separator (id 1, before docs 1..N).
+    // Each such row is a distinct document, so the count of {sentinel,separator}
+    // rows in the pattern's SA interval [lo,hi) is the number of prefix docs.
+    size_t at_hi = wm_.rank(0, r.second) + wm_.rank(1, r.second);
+    size_t at_lo = wm_.rank(0, r.first) + wm_.rank(1, r.first);
+    return at_hi - at_lo;
+}
+
 std::vector<uint64_t>
 FMIndex::LocatePrefixDocs(const uint8_t* pattern, size_t plen) const {
-    std::vector<uint64_t> positions = locateInternal(pattern, plen);
+    if (plen == 0 || c_.empty()) {
+        return {};
+    }
+    auto r = BackwardSearch(pattern, plen);
+    if (r.first >= r.second) {
+        return {};
+    }
     std::vector<uint64_t> docs;
-    for (uint64_t pos : positions) {
-        // A document begins with the pattern iff the occurrence sits exactly on
-        // a document's start boundary. It cannot spill past the document (no
-        // '\0' in the pattern), so no length check is needed.
-        auto it = std::lower_bound(doc_start_.begin(), doc_start_.end(), pos);
-        if (it != doc_start_.end() && *it == pos) {
-            uint64_t doc_id = static_cast<uint64_t>(it - doc_start_.begin());
-            if (doc_id + 1 < doc_start_.size()) {  // not the end sentinel
-                docs.push_back(doc_id);
-            }
-        }
+    // The document-start occurrences of P are exactly the rows in P's SA interval
+    // whose preceding BWT symbol is a separator (id 1, docs 1..N) or the sentinel
+    // (id 0, doc 0). One more backward-search step by each of those two symbols
+    // isolates precisely those rows — so we locate ONLY the answer set and never
+    // touch the (possibly vast) interior occurrences of P.
+    //
+    // Separator-preceded rows: their suffix is "<sep>P...", so the located SA
+    // position is the separator at doc_start_[d]-1; +1 lands on the document
+    // start, whose docOf is the document that begins with P.
+    auto sp = wm_.map2(static_cast<uint32_t>(sep_id_), r.first, r.second);
+    size_t sbase = c_[sep_id_] - first_[sep_id_];
+    for (size_t i = sbase + sp.first; i < sbase + sp.second; ++i) {
+        docs.push_back(docOf(locateRow(i) + 1));
+    }
+    // Sentinel-preceded row (at most one): the sentinel is cyclically followed by
+    // position 0, so a match means document 0 begins with P. No locate needed.
+    auto tp = wm_.map2(0u, r.first, r.second);
+    if (tp.second > tp.first) {
+        docs.push_back(0);
     }
     std::sort(docs.begin(), docs.end());
     docs.erase(std::unique(docs.begin(), docs.end()), docs.end());
     return docs;
 }
 
+std::pair<size_t, size_t>
+FMIndex::suffixDocInterval(const uint8_t* pattern, size_t plen) const {
+    if (plen == 0 || c_.empty()) {
+        return {0, 0};
+    }
+    // Seed on the separator symbol's SA interval: rows whose suffix starts with
+    // the separator (id 1) are [c_[1], c_[2]) — one per document. c_[2] exists
+    // whenever the corpus has any content byte; if not, no non-empty pattern can
+    // match anyway (its bytes are absent below).
+    size_t lo = c_[1];
+    size_t hi = (c_.size() > 2) ? c_[2] : (text_len_ + 1);
+    // Backward-extend by the pattern, right to left, to reach "pattern<sep>".
+    for (size_t k = plen; k-- > 0;) {
+        int32_t id = byte_to_id_[pattern[k]];
+        if (id < 0) {
+            return {0, 0};  // byte absent from the corpus
+        }
+        auto pp = wm_.map2(static_cast<uint32_t>(id), lo, hi);
+        size_t base = c_[id] - first_[id];
+        lo = base + pp.first;
+        hi = base + pp.second;
+        if (lo >= hi) {
+            return {0, 0};
+        }
+    }
+    return {lo, hi};
+}
+
+size_t
+FMIndex::CountSuffixDocs(const uint8_t* pattern, size_t plen) const {
+    auto r = suffixDocInterval(pattern, plen);
+    return r.second - r.first;  // each row is a distinct document ending in P
+}
+
 std::vector<uint64_t>
 FMIndex::LocateSuffixDocs(const uint8_t* pattern, size_t plen) const {
-    std::vector<uint64_t> positions = locateInternal(pattern, plen);
+    auto r = suffixDocInterval(pattern, plen);
     std::vector<uint64_t> docs;
-    for (uint64_t pos : positions) {
-        // A document ends with the pattern iff the occurrence ends exactly on
-        // that document's content end (the byte just before its '\0' separator).
-        uint64_t doc = docOf(pos);
-        uint64_t content_end = doc_start_[doc + 1] - 1;
-        if (pos + plen == content_end) {
-            docs.push_back(doc);
-        }
+    docs.reserve(r.second - r.first);
+    // Every row in the "pattern<sep>" interval is a genuine document-end hit, so
+    // we locate exactly the answer set — no occurrence is located and discarded.
+    // The located SA position is where the pattern begins; its document ends with
+    // the pattern by construction.
+    for (size_t i = r.first; i < r.second; ++i) {
+        docs.push_back(docOf(locateRow(i)));
     }
     std::sort(docs.begin(), docs.end());
     docs.erase(std::unique(docs.begin(), docs.end()), docs.end());

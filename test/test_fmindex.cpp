@@ -840,6 +840,69 @@ TEST(FMIndex, SuffixDocsAnchored) {
     CHECK_EQ(fm.LocateSuffixDocs(bytes(p3), p3.size()), e3);
 }
 
+// Randomized differential oracle for the anchored prefix/suffix doc queries and
+// their counts. Small alphabet + short docs so that most patterns occur BOTH at
+// document boundaries and mid-document — the case where a boundary-anchored
+// result (Count/LocatePrefixDocs/SuffixDocs) legitimately differs from the raw
+// occurrence set, which is exactly what the separator-rank fast paths must get
+// right. Also mixes in patterns borrowed from real doc prefixes/suffixes (to
+// force boundary hits) and patterns over a byte that never appears (empty).
+TEST(FMIndex, PrefixSuffixDocsMatchBruteForce) {
+    std::mt19937 rng(20260714);
+    for (int trial = 0; trial < 200; ++trial) {
+        size_t ndocs = 1 + rng() % 12;
+        std::vector<std::string> docs;
+        docs.reserve(ndocs);
+        for (size_t d = 0; d < ndocs; ++d) {
+            size_t len = rng() % 8;  // 0..7, deliberately includes empty docs
+            std::string s(len, 'a');
+            for (auto& ch : s) {
+                ch = 'a' + (rng() % 3);  // {a,b,c}
+            }
+            docs.push_back(std::move(s));
+        }
+        uint32_t rate = 1 + rng() % 8;
+        FMIndex fm;
+        buildn(fm, docs, rate);
+
+        for (int q = 0; q < 24; ++q) {
+            std::string pat;
+            if ((rng() % 3) == 0) {
+                // Borrow a real prefix or suffix of a random doc to force hits.
+                const std::string& src = docs[rng() % ndocs];
+                if (!src.empty()) {
+                    size_t l = 1 + rng() % src.size();
+                    pat = (rng() & 1) ? src.substr(0, l)
+                                      : src.substr(src.size() - l, l);
+                }
+            }
+            if (pat.empty()) {
+                size_t plen = 1 + rng() % 4;
+                pat.assign(plen, 'a');
+                for (auto& ch : pat) {
+                    ch = 'a' + (rng() % 4);  // 'd' never appears in any doc
+                }
+            }
+            std::vector<uint64_t> ep, es;  // brute-force prefix / suffix doc ids
+            for (uint64_t d = 0; d < ndocs; ++d) {
+                const std::string& s = docs[d];
+                if (s.size() >= pat.size()) {
+                    if (s.compare(0, pat.size(), pat) == 0) {
+                        ep.push_back(d);
+                    }
+                    if (s.compare(s.size() - pat.size(), pat.size(), pat) == 0) {
+                        es.push_back(d);
+                    }
+                }
+            }
+            CHECK_EQ(fm.LocatePrefixDocs(bytes(pat), pat.size()), ep);
+            CHECK_EQ(fm.CountPrefixDocs(bytes(pat), pat.size()), ep.size());
+            CHECK_EQ(fm.LocateSuffixDocs(bytes(pat), pat.size()), es);
+            CHECK_EQ(fm.CountSuffixDocs(bytes(pat), pat.size()), es.size());
+        }
+    }
+}
+
 TEST(FMIndex, CaseInsensitiveMatch) {
     std::string text = "The Quick BROWN fox; the quick brown FOX.";
     FMIndex fm;
