@@ -1685,6 +1685,74 @@ TEST(FMIndex, DeserializeRandomCorruptionNeverCrashes) {
     CHECK(survivors <= 8000);  // reached here without a crash / sanitizer trip
 }
 
+// block_bytes (rank-block granularity) is a pure space/latency knob: every
+// query result must be byte-identical across granularities, the directory must
+// actually shrink as block_bytes grows, and the value must survive a
+// serialize/Deserialize/LoadView round-trip so load rebuilds at the same
+// granularity Build used.
+TEST(FMIndex, BlockGranularityResultsInvariant) {
+    // Large enough to span many blocks and several superblocks at the coarsest
+    // granularity (64 blocks * 16 words * 32 symbols = 32768 symbols/superblock).
+    std::string text;
+    {
+        std::mt19937 rng(0xB10C);
+        const char* al = "acgtACGT_ ";
+        text.reserve(120000);
+        for (int i = 0; i < 120000; ++i) {
+            text.push_back(al[rng() % 10]);
+        }
+    }
+    std::vector<std::string_view> docs{std::string_view(text)};
+    const std::vector<std::string> pats = {
+        "ac", "gtA", "_ ", "zzz", "acgt", "A_", "tt", "GAC"};
+
+    FMIndex ref;
+    ref.Build(docs, /*rate=*/16, /*ci=*/false, /*fw=*/false, /*block_bytes=*/8);
+    CHECK_EQ(ref.block_bytes(), 8u);
+
+    for (uint32_t bb : {16u, 32u, 64u, 128u}) {
+        FMIndex fm;
+        fm.Build(docs, 16, false, false, bb);
+        CHECK_EQ(fm.block_bytes(), bb);
+        // Coarser blocks => strictly smaller rank directory.
+        CHECK(fm.rank_directory_bytes() < ref.rank_directory_bytes());
+        for (const auto& p : pats) {
+            CHECK_EQ(fm.Count(bytes(p), p.size()),
+                     ref.Count(bytes(p), p.size()));
+            CHECK_EQ(fm.MatchingDocs(bytes(p), p.size()),
+                     ref.MatchingDocs(bytes(p), p.size()));
+            CHECK_EQ(fm.LocatePrefixDocs(bytes(p), p.size()),
+                     ref.LocatePrefixDocs(bytes(p), p.size()));
+            CHECK_EQ(fm.LocateSuffixDocs(bytes(p), p.size()),
+                     ref.LocateSuffixDocs(bytes(p), p.size()));
+            CHECK_EQ(offsets(fm, p), offsets(ref, p));
+        }
+    }
+
+    // Round-trip a non-default granularity through Deserialize and LoadView.
+    FMIndex fm;
+    fm.Build(docs, 16, false, false, 32);
+    std::string blob = fm.Serialize();
+
+    FMIndex de = FMIndex::Deserialize(blob);
+    CHECK(de.valid());
+    CHECK_EQ(de.block_bytes(), 32u);
+
+    std::vector<uint64_t> aligned((blob.size() + 7) / 8);
+    std::memcpy(aligned.data(), blob.data(), blob.size());
+    FMIndex vw = FMIndex::LoadView(
+        reinterpret_cast<const uint8_t*>(aligned.data()), blob.size());
+    CHECK(vw.valid());
+    CHECK_EQ(vw.block_bytes(), 32u);
+
+    for (const auto& p : pats) {
+        CHECK_EQ(de.Count(bytes(p), p.size()), ref.Count(bytes(p), p.size()));
+        CHECK_EQ(vw.Count(bytes(p), p.size()), ref.Count(bytes(p), p.size()));
+        CHECK_EQ(offsets(de, p), offsets(ref, p));
+        CHECK_EQ(offsets(vw, p), offsets(ref, p));
+    }
+}
+
 int
 main() {
     setvbuf(stdout, nullptr, _IONBF, 0);  // unbuffered: survive a crash

@@ -59,11 +59,25 @@ class FMIndex {
     //                   true to force the 64-bit path regardless (to exercise the
     //                   wide path on small inputs in tests). The index is
     //                   identical either way.
+    //   block_bytes     rank-directory block granularity, in bytes; a power-of-
+    //                   two multiple of 8 in [8, 128]. One rel_ sample (8 B) is
+    //                   kept per block, so the wavelet rank directory — the part
+    //                   that stays resident even under an mmap view — is
+    //                   ~ (8 / block_bytes) x the packed words. Default 64 (8
+    //                   words/block): ~8x smaller directory than the finest
+    //                   8-byte block at essentially no rank-throughput cost
+    //                   across corpus sizes (the smaller directory's better cache
+    //                   locality offsets the extra SWAR popcounts — see
+    //                   BENCHMARK.md). Use 8-32 for tiny indices whose directory
+    //                   already fits cache, or 128 to minimize resident memory at
+    //                   a small speed cost on small corpora. Pure space/latency
+    //                   knob, zero effect on correctness.
     void
     Build(const std::vector<std::string_view>& docs,
           uint32_t sa_sample_rate = 32,
           bool case_insensitive = false,
-          bool force_wide = false);
+          bool force_wide = false,
+          uint32_t block_bytes = 64);
 
     // Half-open SA interval [lo, hi) for pattern; lo==hi means no match.
     std::pair<size_t, size_t>
@@ -199,6 +213,24 @@ class FMIndex {
     case_insensitive() const {
         return case_fold_;
     }
+    // Rank-directory block size in bytes (words_per_block * 8). Larger = smaller
+    // directory / less resident RAM, slightly slower rank. Default 8 (one word).
+    uint32_t
+    block_bytes() const {
+        return words_per_block_ * 8;
+    }
+    // Total heap bytes of the wavelet rank directories — the part that stays
+    // resident even when the packed words are an mmap view. Scales ~1/block_bytes
+    // (one 8-byte rel_ sample per block); benchmarks use it to report the
+    // directory-space vs rank-latency tradeoff of block_bytes.
+    size_t
+    rank_directory_bytes() const {
+        size_t t = 0;
+        for (const auto& q : wm_.levels_qv()) {
+            t += q.directory_bytes();
+        }
+        return t;
+    }
     // False for a default-constructed index or one whose Deserialize/LoadView
     // failed (a failed load yields an empty index that answers 0 to everything);
     // callers loading from disk should check this.
@@ -276,6 +308,7 @@ class FMIndex {
     writeHeader(std::string& s) const;
 
     uint32_t sa_sample_rate_ = 1;
+    uint32_t words_per_block_ = 1;  // rank-block granularity (block_bytes / 8)
     bool case_fold_ = false;     // ASCII A-Z folded to a-z at build time
     bool wide_storage_ = false;  // sampled-SA positions stored 8B (>=4GiB)
     uint64_t text_len_ = 0;  // INTERNAL length incl. separators, no sentinel

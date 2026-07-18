@@ -34,7 +34,8 @@ inline void
 FMIndex::Build(const std::vector<std::string_view>& docs,
                uint32_t sa_sample_rate,
                bool case_insensitive,
-               bool force_wide) {
+               bool force_wide,
+               uint32_t block_bytes) {
     // Internal layout: each document's bytes are remapped to dense content ids,
     // and a separator symbol (dense id 1, OUTSIDE the byte alphabet) is injected
     // after each. That separator makes every query document-scoped: no query
@@ -60,6 +61,23 @@ FMIndex::Build(const std::vector<std::string_view>& docs,
         throw std::length_error("FMIndex: corpus too large (>= 2^63 bytes)");
     }
     sa_sample_rate_ = sa_sample_rate == 0 ? 1 : sa_sample_rate;
+    // block_bytes -> words_per_block (8 B = one 64-bit word). Require a
+    // power-of-two multiple of 8 in [8, 128]; QuadVector re-clamps defensively.
+    {
+        uint32_t bb = block_bytes == 0 ? 8 : block_bytes;
+        uint32_t wpb = bb / 8;
+        if (wpb < 1) {
+            wpb = 1;
+        }
+        if (wpb > 16) {
+            wpb = 16;
+        }
+        uint32_t p = 1;
+        while (p * 2 <= wpb) {
+            p *= 2;
+        }
+        words_per_block_ = p;
+    }
     case_fold_ = case_insensitive;
     // Store positions 8 bytes wide once they can exceed uint32 (>= 4 GiB), or
     // when forced (lets tests exercise the wide path on small inputs).
@@ -186,7 +204,7 @@ FMIndex::Build(const std::vector<std::string_view>& docs,
 
     // 6. quad wavelet matrix over the BWT (moved in — the BWT buffer becomes the
     //    wavelet's working array, no copy) + per-symbol map_zero baseline.
-    wm_ = WaveletMatrix4(std::move(bwt), qlevels_);
+    wm_ = WaveletMatrix4(std::move(bwt), qlevels_, words_per_block_);
     FMIX_MEM("after wavelet");
     first_.resize(sigma_);
     for (uint32_t c = 0; c < sigma_; ++c) {
@@ -812,7 +830,9 @@ get(const char*& p, const char* end) {
 constexpr uint32_t kMagic = 0x464D4958;  // "FMIX"
 // v7: separator is an out-of-byte-alphabet symbol (dense id 1), so '\0' is
 // ordinary content; content ids are 2..sigma. Not backward-compatible with v6.
-constexpr uint32_t kFormatVersion = 7;
+// v8: the flags word carries words_per_block (rank-block granularity) in bits
+// 8-15, so load rebuilds the directory at the same granularity Build used.
+constexpr uint32_t kFormatVersion = 8;
 
 inline void
 FMIndex::writeHeader(std::string& s) const {
@@ -822,10 +842,12 @@ FMIndex::writeHeader(std::string& s) const {
     put(s, sigma_);
     put(s, qlevels_);
     // Flags live in the former 4-byte alignment pad (keeps text_len 8-aligned):
-    // bit 0 = ASCII case-insensitive, bit 1 = 8-byte sampled-SA storage.
+    // bit 0 = ASCII case-insensitive, bit 1 = 8-byte sampled-SA storage,
+    // bits 8-15 = words_per_block (rank-block granularity).
     put(s,
         static_cast<uint32_t>((case_fold_ ? 1u : 0u) |
-                              (wide_storage_ ? 2u : 0u)));
+                              (wide_storage_ ? 2u : 0u) |
+                              (words_per_block_ << 8)));
     put(s, text_len_);
     for (int32_t v : byte_to_id_) {
         put(s, v);
@@ -939,6 +961,14 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         uint32_t flags = get<uint32_t>(p, end);  // former pad, now flags
         case_fold_ = (flags & 1u) != 0;
         wide_storage_ = (flags & 2u) != 0;
+        words_per_block_ = (flags >> 8) & 0xFFu;
+        // Must be a power of two in [1, 16] (kBlocksPerSb * wpb * 32 <= 65535,
+        // the uint16 rel_ counter). A mutated value would rebuild the directory
+        // at the wrong granularity and read the rank samples out of step.
+        if (words_per_block_ < 1 || words_per_block_ > 16 ||
+            (words_per_block_ & (words_per_block_ - 1)) != 0) {
+            return false;
+        }
         if (sigma_ < 2 || sigma_ > 258 || qlevels_ > 5) {
             return false;  // 2 (sentinel+sep) .. 258 (+256 content bytes)
         }
@@ -1018,7 +1048,8 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         qvs.reserve(qlevels_);
         for (uint32_t l = 0; l < qlevels_; ++l) {
             const uint64_t* w = align_view(qnw[l] * sizeof(uint64_t));
-            qvs.push_back(QuadVector::from_view(m, w, qnw[l]));
+            qvs.push_back(
+                QuadVector::from_view(m, w, qnw[l], words_per_block_));
         }
         // The group-start offsets are fully determined by the quad vectors: the
         // four per-level digit counts always sum to m, so the derived offsets are

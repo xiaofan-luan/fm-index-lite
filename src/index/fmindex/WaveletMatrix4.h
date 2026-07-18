@@ -23,7 +23,9 @@ class WaveletMatrix4 {
     // becomes the working array). Memory during construction is two n-element
     // uint16 buffers (cur + next, ping-ponged across levels) plus one n-byte
     // digit array — not the 4 growable buckets of a naive partition.
-    WaveletMatrix4(std::vector<uint16_t> seq, uint32_t qlevels)
+    WaveletMatrix4(std::vector<uint16_t> seq,
+                   uint32_t qlevels,
+                   uint32_t words_per_block = 1)
         : n_(seq.size()), qlevels_(qlevels) {
         qv_.reserve(qlevels_);
         start_.assign(qlevels_, {0, 0, 0, 0});
@@ -38,7 +40,7 @@ class WaveletMatrix4 {
                 digits[i] = d;
                 ++hist[d];
             }
-            qv_.emplace_back(digits);
+            qv_.emplace_back(digits, words_per_block);
             start_[l][0] = 0;
             start_[l][1] = hist[0];
             start_[l][2] = hist[0] + hist[1];

@@ -148,6 +148,34 @@ are **3–6× faster than the reference at equal size**.
 The full unit-test suite passes; counts were byte-identical to sdsl across 120k
 queries throughout development.
 
+## Rank-block granularity (`block_bytes`)
+
+The wavelet rank directory (one 8-byte `rel_` sample per block) is rebuilt on
+load and stays resident even when the packed words are an mmap view, so it
+dominates the resident RAM of a mmap'd index. `block_bytes` sets how many bytes
+of packed words one block spans: the directory shrinks ~ `8 / block_bytes`. It
+is a pure space/latency knob — results are byte-identical across values
+(`BlockGranularityResultsInvariant` test).
+
+`bench_blocksize`, resident directory as a fraction of corpus (constant across
+sizes) and `LocateDocs` throughput vs the finest 8-byte block, sample rate 8:
+
+| block_bytes | directory / corpus | locate q/s vs block=8 |
+|---|---|---|
+| 8 (finest) | 0.53–0.80x | baseline |
+| 32 | 0.13–0.20x | ≈ baseline .. +48% |
+| **64 (default)** | **0.07–0.10x** | **−6% (4 MiB) .. +50% (16 MiB)** |
+| 128 | 0.03–0.05x | −18% (4 MiB) .. +98% (16 MiB) |
+
+The directory shrinks monotonically; throughput is an inverted-U with the peak
+near 32–64. A coarser block does *more* SWAR popcounts per rank but the smaller
+directory has far better cache locality, and on corpora whose 8-byte directory
+overflows cache (≥ 16 MiB here) that wins outright. At 256 MiB every value is
+within ~5% on speed while the directory still drops 16×. **Default 64**: ~8×
+smaller resident directory than the finest block at no throughput cost across
+4 MiB–256 MiB (text and DNA); the on-disk index size is unchanged (the directory
+is not serialized). Use 8–32 for tiny indices, 128 to minimize resident memory.
+
 ## Reproduce
 
 ```bash
@@ -155,6 +183,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4
 ./build/bench_fmindex     # ours: build / count / batch / locate / size (4 MB sweep)
 ./build/bench_mmap        # in-RAM vs mmap query throughput
 ./build/bench_gig [GiB]   # 1 GiB (default) document-scoped build + query, peak RSS
+./build/bench_blocksize [corpus_bytes] [kind 0=dna 1=text]  # block_bytes sweep
 ```
 
 The sdsl-lite (`csa_wt`) and Lance (`lancedb` 0.31, `Index::Fm`) numbers above were
