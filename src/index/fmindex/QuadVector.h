@@ -35,6 +35,27 @@ class QuadVector {
         build_rank();
     }
 
+    // Pack one 2-bit wavelet digit directly from the uint16 symbol stream while
+    // collecting its histogram. Recomputing the digit during the subsequent
+    // stable scatter avoids a separate one-byte-per-symbol digits array.
+    QuadVector(const std::vector<uint16_t>& syms,
+               uint32_t shift,
+               std::array<size_t, 4>& hist,
+               uint32_t words_per_block = 1)
+        : n_(syms.size()), owned_words_((syms.size() + 31) / 32, 0ULL) {
+        set_words_per_block(words_per_block);
+        hist = {0, 0, 0, 0};
+        for (size_t i = 0; i < n_; ++i) {
+            const uint8_t digit = (syms[i] >> shift) & 3u;
+            owned_words_[i >> 5] |=
+                (uint64_t(digit) << (2 * (i & 31)));
+            ++hist[digit];
+        }
+        words_ = owned_words_.data();
+        nwords_ = owned_words_.size();
+        build_rank();
+    }
+
     QuadVector(const QuadVector&) = delete;
     QuadVector&
     operator=(const QuadVector&) = delete;

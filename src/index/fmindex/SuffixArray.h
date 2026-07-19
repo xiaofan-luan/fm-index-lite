@@ -8,10 +8,98 @@
 #include <string>
 #include <vector>
 
+#if (defined(__unix__) || defined(__APPLE__)) && !defined(__SANITIZE_ADDRESS__)
+#if defined(__has_feature)
+#if !__has_feature(address_sanitizer)
+#define FMIX_USE_MMAP_SCRATCH 1
+#endif
+#else
+#define FMIX_USE_MMAP_SCRATCH 1
+#endif
+#endif
+
+#ifdef FMIX_USE_MMAP_SCRATCH
+#include <sys/mman.h>
+#endif
+
 #include "libsais.h"    // Apache-2.0, vendored under third_party/libsais
 #include "libsais64.h"  // int64 SA path for corpora >= 2 GiB
 
 namespace milvus::index::fmindex {
+
+inline constexpr size_t kSuffixArrayExtraSpace = 6 * 1024;
+
+// Large build-only arrays should disappear from RSS as soon as their phase is
+// complete. Some allocators retain differently-sized freed blocks, so later
+// wavelet allocations can otherwise stack on top of dead SA/text pages. Use a
+// private mapping for large scratch buffers on POSIX and release it with munmap;
+// small and sanitizer builds retain std::vector's checking/faster setup.
+template <typename T>
+class ScratchArray {
+ public:
+    explicit ScratchArray(size_t size) : size_(size) {
+#ifdef FMIX_USE_MMAP_SCRATCH
+        const size_t bytes = size_ * sizeof(T);
+        if (bytes >= (size_t{1} << 20)) {
+            void* mapping = mmap(
+                nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (mapping != MAP_FAILED) {
+                data_ = static_cast<T*>(mapping);
+                mapped_bytes_ = bytes;
+                return;
+            }
+        }
+#endif
+        owned_.resize(size_);
+        data_ = owned_.data();
+    }
+
+    ScratchArray(const ScratchArray&) = delete;
+    ScratchArray&
+    operator=(const ScratchArray&) = delete;
+
+    ~ScratchArray() {
+        release();
+    }
+
+    T*
+    data() {
+        return data_;
+    }
+
+    const T*
+    data() const {
+        return data_;
+    }
+
+    T&
+    operator[](size_t i) {
+        return data_[i];
+    }
+
+    void
+    release() {
+#ifdef FMIX_USE_MMAP_SCRATCH
+        if (mapped_bytes_ != 0) {
+            munmap(data_, mapped_bytes_);
+            mapped_bytes_ = 0;
+        }
+#endif
+        std::vector<T>().swap(owned_);
+        data_ = nullptr;
+        size_ = 0;
+    }
+
+ private:
+    size_t size_ = 0;
+    T* data_ = nullptr;
+    size_t mapped_bytes_ = 0;
+    std::vector<T> owned_;
+};
+
+#ifdef FMIX_USE_MMAP_SCRATCH
+#undef FMIX_USE_MMAP_SCRATCH
+#endif
 
 // libsais returns 0 on success, -1 on invalid arguments, and -2 on allocation
 // failure (see libsais.h). Ignoring it would let a partially-built or
@@ -30,9 +118,8 @@ check_libsais_rc(int64_t rc) {
 // Suffix array via libsais (SA-IS, linear time). Input is a symbol vector
 // (bytes remapped to 1..256 plus a sentinel 0, alphabet <= 257). Produces the
 // standard suffix array (end-of-string smallest), matching the brute-force
-// oracle. This int-alphabet entry point is kept for the unit tests; FMIndex::
-// Build uses the byte entry points below (build_suffix_array_bytes / _bytes64).
-// For n < 2^31.
+// oracle. This convenience entry point is kept for the unit tests; FMIndex::
+// Build writes directly into releasable scratch buffers below. For n < 2^31.
 inline std::vector<uint32_t>
 build_suffix_array(const std::vector<uint32_t>& s) {
     const size_t n = s.size();
@@ -66,27 +153,29 @@ build_suffix_array(const std::vector<uint32_t>& s) {
 // sentinel (dense id 0, unique-smallest, appears once at t[m-1]). Content ids
 // are in [2, sigma) and the document separator is id 1; because the remap is
 // order-preserving, the id SA order equals the byte/token SA order. This is the
-// v2 build path — the separator is a symbol OUTSIDE the byte alphabet, so any
-// byte (including '\0') is storable and queryable. `libsais_int` documents that
-// it modifies the input during construction but RESTORES it on success, so the
-// caller may reuse `t` afterward (FMIndex computes the BWT from it). For m < 2^31.
-inline std::vector<int32_t>
-build_suffix_array_symbols32(int32_t* t, size_t m, int32_t sigma) {
+// v2 compact build path — the separator is a symbol OUTSIDE the byte alphabet,
+// so any byte (including '\0') is storable and queryable. The input and output
+// buffers are caller-owned scratch mappings so they can be unmapped immediately
+// after the BWT/sampling phase. For m <= INT32_MAX.
+inline void
+build_suffix_array_symbols32(int32_t* t,
+                             size_t m,
+                             int32_t sigma,
+                             int32_t* sa) {
     if (m <= 1) {
-        return std::vector<int32_t>(m,
-                                    0);  // empty or lone-sentinel: SA=[0] or []
+        if (m == 1) {
+            sa[0] = 0;
+        }
+        return;
     }
-    const int32_t fs = 6 * 1024;  // recommended free space for performance
-    std::vector<int32_t> sa(m + fs);
+    constexpr int32_t fs = static_cast<int32_t>(kSuffixArrayExtraSpace);
 #ifdef LIBSAIS_OPENMP
     int32_t rc =
-        libsais_int_omp(t, sa.data(), static_cast<int32_t>(m), sigma, fs, 0);
+        libsais_int_omp(t, sa, static_cast<int32_t>(m), sigma, fs, 0);
 #else
-    int32_t rc = libsais_int(t, sa.data(), static_cast<int32_t>(m), sigma, fs);
+    int32_t rc = libsais_int(t, sa, static_cast<int32_t>(m), sigma, fs);
 #endif
     check_libsais_rc(rc);
-    sa.resize(m);
-    return sa;
 }
 
 // 64-bit counterpart (int64 positions), for m >= 2^31 and up to 2^63. Same

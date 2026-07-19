@@ -360,14 +360,15 @@ class FMIndex {
     BitVector sampled_bv_;  // row is SA-sampled? rank = sample index
 
     // SA values of sampled rows, in row order — serialized at 4 bytes when
-    // len < 2^32 (narrow), else 8 (wide). Build owns them in sample_vals_owned_
-    // (wide in RAM); a load VIEWS them straight from the (mmap'd or owned) blob
-    // in whichever width they were stored — no heap copy, no widening pass.
+    // len < 2^32 (narrow), else 8 (wide). Build keeps the same width in RAM; a
+    // load VIEWS them straight from the (mmap'd or owned) blob with no heap copy
+    // or widening pass.
     // Exactly one of sv_wide_ / sv_narrow_ is set on a valid index; all access
     // goes through sample_val(). At the default sample rate these arrays are of
     // the same order as the whole blob, so copying them on load would defeat
     // mmap's memory story.
-    std::vector<uint64_t> sample_vals_owned_;  // Build-mode storage only
+    std::vector<uint32_t> sample_vals_narrow_owned_;  // Build-mode storage only
+    std::vector<uint64_t> sample_vals_wide_owned_;    // Build-mode storage only
     const uint64_t* sv_wide_ = nullptr;
     const uint32_t* sv_narrow_ = nullptr;
     size_t n_samples_ = 0;

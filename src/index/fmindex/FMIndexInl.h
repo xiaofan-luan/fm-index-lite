@@ -122,15 +122,16 @@ FMIndex::Build(const std::vector<std::string_view>& docs,
 
     const size_t m = len + 1;  // + trailing sentinel
     // 2. Materialize the dense-id symbol text t (content ids, separators id 1,
-    //    trailing sentinel id 0) and build the SA over it. byte_to_id_ already
-    //    collapses letter case (uppercase aliases lowercase's id), so the symbol
-    //    text is folded implicitly — no separate folded byte copy. libsais
-    //    restores t on success, so it is reused below to compute the BWT.
-    //    Only one of t32/t64 (and sa32/sa64) is allocated.
-    std::vector<int32_t> t32, sa32;
+    //    trailing sentinel id 0) and build the SA. The compact path uses int32
+    //    text + int32 SA in releasable scratch mappings. The SA is later
+    //    overwritten with BWT symbols, so no separate BWT allocation overlaps
+    //    the 4x text + 4x SA window.
+    ScratchArray<int32_t> t32(use64 ? 0 : m);
+    ScratchArray<int32_t> sa32(
+        use64 ? 0 : m + kSuffixArrayExtraSpace);
     std::vector<int64_t> t64, sa64;
-    auto fill_symbols = [&](auto& t) {
-        t.resize(m);
+    std::vector<uint16_t> bwt;
+    auto fill_symbols = [&](auto* t) {
         size_t pos = 0;
         for (const auto& d : docs) {
             for (unsigned char c : d) {
@@ -141,38 +142,78 @@ FMIndex::Build(const std::vector<std::string_view>& docs,
         t[pos] = 0;  // trailing sentinel (pos == len == m-1)
     };
     if (use64) {
-        fill_symbols(t64);
+        t64.resize(m);
+        fill_symbols(t64.data());
         sa64 = build_suffix_array_symbols64(
             t64.data(), m, static_cast<int64_t>(sigma_));
     } else {
-        fill_symbols(t32);
-        sa32 = build_suffix_array_symbols32(
-            t32.data(), m, static_cast<int32_t>(sigma_));
+        fill_symbols(t32.data());
+        build_suffix_array_symbols32(
+            t32.data(), m, static_cast<int32_t>(sigma_), sa32.data());
     }
     FMIX_MEM("after SA");
     auto sa_at = [&](size_t i) -> uint64_t {
         return use64 ? static_cast<uint64_t>(sa64[i])
                      : static_cast<uint64_t>(sa32[i]);
     };
-    auto t_at = [&](size_t i) -> uint16_t {
-        return use64 ? static_cast<uint16_t>(t64[i])
-                     : static_cast<uint16_t>(t32[i]);
-    };
 
-    // 3. BWT of dense ids, read straight from the symbol text: bwt[i] is the
-    //    symbol preceding row i's suffix; row where sa[i]==0 wraps to the
-    //    sentinel (0). Symbols are dense ids in [0, sigma) (<= 258 for bytes), so
-    //    uint16 holds them and halves this buffer and the wavelet's.
-    std::vector<uint16_t> bwt(m);
+    // 3. Sample the SA before its compact-path storage is repurposed. Build keeps
+    //    sampled
+    //    positions 4 bytes wide below 4 GiB, matching the serialized format,
+    //    instead of temporarily widening every sample to uint64.
+    BitVector samp(m);
+    sample_vals_narrow_owned_.clear();
+    sample_vals_wide_owned_.clear();
+    const size_t expected_samples = (m - 1) / sa_sample_rate_ + 1;
+    if (wide_storage_) {
+        sample_vals_wide_owned_.reserve(expected_samples);
+    } else {
+        sample_vals_narrow_owned_.reserve(expected_samples);
+    }
     for (size_t i = 0; i < m; ++i) {
         uint64_t v = sa_at(i);
-        bwt[i] = (v == 0) ? uint16_t{0} : t_at(v - 1);
+        if (v % sa_sample_rate_ == 0) {
+            samp.set(i);
+            if (wide_storage_) {
+                sample_vals_wide_owned_.push_back(v);
+            } else {
+                sample_vals_narrow_owned_.push_back(static_cast<uint32_t>(v));
+            }
+        }
     }
-    std::vector<int32_t>().swap(t32);  // symbol text no longer needed
-    std::vector<int64_t>().swap(t64);
+    samp.build_rank();
+    sampled_bv_ = std::move(samp);
+    FMIX_MEM("after sampling");
+
+    // 4. Build the BWT. On the compact path, overwrite each consumed SA entry
+    //    with its uint16 BWT symbol, release the text mapping, then narrow the SA
+    //    scratch into the final BWT vector. The extra sequential narrowing pass
+    //    is cheaper than a random in-place permutation and keeps peak RSS below
+    //    the original text+SA+BWT window.
+    if (use64) {
+        bwt.resize(m);
+        for (size_t i = 0; i < m; ++i) {
+            const uint64_t v = static_cast<uint64_t>(sa64[i]);
+            bwt[i] =
+                v == 0 ? uint16_t{0} : static_cast<uint16_t>(t64[v - 1]);
+        }
+        std::vector<int64_t>().swap(t64);
+        std::vector<int64_t>().swap(sa64);
+    } else {
+        for (size_t i = 0; i < m; ++i) {
+            const int32_t v = sa32[i];
+            sa32[i] = v == 0 ? 0 : t32[static_cast<size_t>(v - 1)];
+        }
+        t32.release();
+        bwt.resize(m);
+        for (size_t i = 0; i < m; ++i) {
+            bwt[i] = static_cast<uint16_t>(sa32[i]);
+        }
+        sa32.release();
+    }
     FMIX_MEM("after BWT");
 
-    // 4. C-table over sigma_ (cumulative counts can reach m, so 64-bit)
+    // 5. C-table over sigma_ (cumulative counts can reach m, so 64-bit).
     c_.assign(sigma_, 0);
     for (uint32_t sym : bwt) {
         c_[sym]++;
@@ -184,27 +225,9 @@ FMIndex::Build(const std::vector<std::string_view>& docs,
         acc += cnt;
     }
 
-    // 5. sampled SA (needs the SA, not the BWT): do it before the wavelet so the
-    //    SA can be freed and does not stack onto the wavelet's peak memory.
-    BitVector samp(m);
-    sample_vals_owned_.clear();
-    sample_vals_owned_.reserve(m / sa_sample_rate_ + 1);
-    for (size_t i = 0; i < m; ++i) {
-        uint64_t v = sa_at(i);
-        if (v % sa_sample_rate_ == 0) {
-            samp.set(i);
-            sample_vals_owned_.push_back(v);
-        }
-    }
-    samp.build_rank();
-    sampled_bv_ = std::move(samp);
-    std::vector<int32_t>().swap(
-        sa32);  // SA no longer needed — free before wavelet
-    std::vector<int64_t>().swap(sa64);
-    FMIX_MEM("after sampling");
-
-    // 6. quad wavelet matrix over the BWT (moved in — the BWT buffer becomes the
-    //    wavelet's working array, no copy) + per-symbol map_zero baseline.
+    // 6. Quad wavelet matrix over the BWT. The moved BWT is one of the two
+    //    ping-pong buffers; digits are packed directly without an n-byte side
+    //    array.
     wm_ = WaveletMatrix4(std::move(bwt), qlevels_, words_per_block_);
     FMIX_MEM("after wavelet");
     first_.resize(sigma_);
@@ -214,9 +237,15 @@ FMIndex::Build(const std::vector<std::string_view>& docs,
 
     // Point the access views at the owned storage. Vector moves keep their heap
     // buffer address, so these stay valid when the whole FMIndex is moved.
-    sv_wide_ = sample_vals_owned_.data();
-    sv_narrow_ = nullptr;
-    n_samples_ = sample_vals_owned_.size();
+    if (wide_storage_) {
+        sv_wide_ = sample_vals_wide_owned_.data();
+        sv_narrow_ = nullptr;
+        n_samples_ = sample_vals_wide_owned_.size();
+    } else {
+        sv_narrow_ = sample_vals_narrow_owned_.data();
+        sv_wide_ = nullptr;
+        n_samples_ = sample_vals_narrow_owned_.size();
+    }
     doc_start_ = doc_bounds_owned_.data();
     n_doc_bounds_ = doc_bounds_owned_.size();
 
@@ -913,10 +942,8 @@ FMIndex::Serialize() const {
         s.append(reinterpret_cast<const char*>(sv_wide_),
                  n_samples_ * sizeof(uint64_t));
     } else {
-        for (size_t i = 0; i < n_samples_; ++i) {
-            uint32_t x = static_cast<uint32_t>(sample_val(i));
-            s.append(reinterpret_cast<const char*>(&x), sizeof(x));
-        }
+        s.append(reinterpret_cast<const char*>(sv_narrow_),
+                 n_samples_ * sizeof(uint32_t));
     }
     align8();
     s.append(reinterpret_cast<const char*>(doc_start_),
@@ -956,10 +983,7 @@ FMIndex::SerializeToFile(const std::string& path) const {
     if (wide_storage_) {
         emit(sv_wide_, n_samples_ * sizeof(uint64_t));
     } else {
-        for (size_t i = 0; i < n_samples_; ++i) {
-            uint32_t x = static_cast<uint32_t>(sample_val(i));
-            emit(&x, sizeof(x));
-        }
+        emit(sv_narrow_, n_samples_ * sizeof(uint32_t));
     }
     pad8();
     emit(doc_start_, n_doc_bounds_ * sizeof(uint64_t));
@@ -980,6 +1004,9 @@ FMIndex::SerializeToFile(const std::string& path) const {
 
 inline bool
 FMIndex::parseView(const uint8_t* base, size_t size) {
+    if (base == nullptr) {
+        return false;
+    }
     const char* p = reinterpret_cast<const char*>(base);
     const char* end = p + size;
     try {

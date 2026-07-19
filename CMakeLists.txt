@@ -78,5 +78,8 @@ target_link_libraries(bench_gig PRIVATE fmindex)
 add_executable(bench_blocksize bench/bench_blocksize.cpp)
 target_link_libraries(bench_blocksize PRIVATE fmindex)
 
+add_executable(bench_build_memory bench/bench_build_memory.cpp)
+target_link_libraries(bench_build_memory PRIVATE fmindex)
+
 enable_testing()
 add_test(NAME fmindex_tests COMMAND test_fmindex)

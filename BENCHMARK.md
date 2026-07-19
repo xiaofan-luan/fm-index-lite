@@ -114,6 +114,27 @@ single documents.
   `LocateDocs`/`MatchingDocs` latency is dominated by the single LF-walk to a sampled
   position (≤ `sa_sample_rate` steps). Patterns with many hits scale with hit count.
 
+## Compact-build memory A/B (long row)
+
+`bench_build_memory` isolates the byte amplification by building over one long
+printable-byte document. Apple Silicon, Release build, OpenMP off,
+`sa_sample_rate=8`, `block_bytes=64`; each 64 MiB result is three fresh-process
+runs with identical output.
+
+| corpus | implementation | build time | peak RSS | peak / corpus |
+|---|---|---:|---:|---:|
+| 64 MiB | prior int32 text + SA + separate BWT | 3.25–3.30 s | 916.4–916.5 MiB | **14.32×** |
+| 64 MiB | releasable scratch + SA/BWT reuse + narrow samples | 3.07–3.12 s | 619.5 MiB | **9.68×** |
+| 256 MiB | optimized | 13.0 s | 2473.5 MiB | **9.66×** |
+
+The reduction is structural, not a smaller test artifact: the ratio stays flat
+from 64 to 256 MiB. At the old peak, caller data (1×), int32 symbol text (4×),
+int32 SA (4×), and uint16 BWT (2×) overlapped, and later allocator-retained
+blocks stacked with sampling/wavelet allocations. The optimized path samples
+before repurposing the SA, overwrites SA entries with BWT symbols, releases the
+text mapping, and only then materializes the uint16 BWT. It also stores compact
+sample values as uint32 and removes the wavelet's n-byte digit array.
+
 ## Scorecard vs sdsl (the apples-to-apples reference)
 
 | axis | verdict |
@@ -183,6 +204,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4
 ./build/bench_fmindex     # ours: build / count / batch / locate / size (4 MB sweep)
 ./build/bench_mmap        # in-RAM vs mmap query throughput
 ./build/bench_gig [GiB]   # 1 GiB (default) document-scoped build + query, peak RSS
+./build/bench_build_memory [MiB] [sample_rate] [block_bytes]  # one-long-row peak RSS
 ./build/bench_blocksize [corpus_bytes] [kind 0=dna 1=text]  # block_bytes sweep
 ```
 

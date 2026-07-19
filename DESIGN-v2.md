@@ -95,15 +95,17 @@ Notes:
 - **Chosen over `libsais16`.** An upstream `libsais16` (u16 text, 2 B/sym) would
   cut staging memory but must be vendored fresh and would still fall back to the
   int paths for token σ > 65 535. `libsais_int` is already in-tree, one path for
-  both modes, and correctness-first; the u16 staging optimization is a
-  deferrable follow-up (halves the text buffer only), not a prerequisite.
-- **Build memory.** The symbol text is built directly from the caller's
-  documents (no intermediate byte concat buffer), int32 for the compact path.
-  Peak during construction ≈ text(4m) + SA(4m) then + BWT(2m) ≈ **~10× corpus**
-  for the 32-bit path (v1 was ~8×; the delta is the int32 text vs v1's byte
-  buffer). The 64-bit path (≥ 2 GiB, shard territory) doubles the text/SA to
-  ~16m. Re-benchmark and update `BENCHMARK.md`. The u16 staging follow-up would
-  bring the 32-bit peak back toward ~8×.
+  both modes, and remains faster on the measured long-row corpus.
+- **Build memory (implemented optimization).** The compact path keeps int32 text
+  and int32 SA in build-only scratch mappings. It samples the SA first, then
+  overwrites each consumed SA entry with its BWT symbol, unmaps the text, and
+  narrows the overwritten SA into the uint16 BWT. Consequently BWT allocation no
+  longer overlaps text + SA. Sample values stay uint32 below 4 GiB, and wavelet
+  construction packs digits directly rather than allocating an n-byte digit
+  array. The long-row process peak is therefore caller text (1m) + symbol text
+  (4m) + SA (4m) + rate-8 samples/rank (~0.66m) = **~9.66× corpus**, rather than
+  the former allocator high-water of ~14.3×. The 64-bit path (≥ 2 GiB, shard
+  territory) still widens text/SA and should be handled by sharding.
 - **Query path and index size are unchanged** — same qlevels (σ 257→258 does not
   cross a power-of-two boundary), same BWT/wavelet/sampled structures.
 
@@ -181,7 +183,7 @@ patterns with `\0` just work).
 
 | axis | v1 | v2 expected |
 |---|---|---|
-| byte build peak RSS | ~8× corpus (9.1× measured incl. caller docs) | **~10×** (int32 symbol text; u16 staging follow-up → ~9×) |
+| byte build peak RSS | ~8× corpus (9.1× measured incl. caller docs) | **9.68× measured** at rate 8, including caller docs (64–256 MiB long-row corpus) |
 | byte build time (1 GiB) | 44.6 s | to measure (`libsais_int` vs byte `libsais`) |
 | byte query (count/locate/match) | — | **unchanged** (same qlevels, same structures) |
 | byte index size | 1.01× corpus | unchanged (BWT symbols, samples identical) |
@@ -222,8 +224,9 @@ patterns with `\0` just work).
    *(Requirement 2.)*
 3. **Alignment APIs** (§6) + tests. *(Requirement 3.)*
 4. **Benchmark sweep + BENCHMARK.md / DESIGN.md / README.md updates.**
-5. **(Optional) u16 staging** via a vendored `libsais16` — memory-only, halves
-   the symbol-text buffer; deferrable.
+5. **✅ Compact build-memory pass.** Releasable text/SA scratch, SA-to-BWT buffer
+   reuse, narrow build-time samples, and digit-free wavelet construction; long-row
+   peak 14.32× → 9.68× at rate 8 without a build-time regression.
 
 Steps 2–3 are independently shippable; **Milvus vendoring can start now** (step 1
 done — the library fully supports `\0`), with token mode and alignment APIs

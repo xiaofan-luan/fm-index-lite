@@ -52,12 +52,13 @@ internal = "doc A text..." ⎵ "doc B text..." ⎵ "doc C text..." ⎵   // ⎵ 
   when the boundary byte would be `\0`. It applies to *every* primitive, `Count`
   included, so `Count` is per-document exact **and** still O(1) in the match interval.
 - One index handles corpora up to **2^63 bytes**: the suffix array is built with
-  32-bit indices under 2 GiB (compact, less build memory) and 64-bit indices at or
-  above it — chosen automatically. Sampled positions likewise serialize 4 bytes
-  wide under 4 GiB, 8 above, so a small corpus keeps a small index. Going past
-  2 GiB in one index is mostly limited by **build memory** (~10× the corpus with
-  the int32 symbol-text SA path), so for large data prefer one index per
-  shard/segment (this is how it plugs into Milvus, one index per sealed segment).
+  32-bit indices under 2 GiB and 64-bit indices at or above it — chosen
+  automatically. Sampled positions likewise serialize 4 bytes wide under 4 GiB,
+  8 above, so a small corpus keeps a small index. The compact build path keeps
+  long-row peak RSS below 10× corpus (9.68× measured at the locate-tuned sample
+  rate 8, including the caller's resident source data); going past 2 GiB switches
+  to wider staging, so large data should still use one index per shard/segment
+  (this is how it plugs into Milvus, one index per sealed segment).
 
 ## Quick start
 
@@ -190,6 +191,7 @@ cmake --build build -j4
 ./build/bench_fmindex    # build / count / batch / locate / size (4 MB sweep)
 ./build/bench_mmap       # in-RAM vs mmap query throughput
 ./build/bench_gig [GiB]  # 1 GiB document-scoped build + query, peak RSS
+./build/bench_build_memory [MiB] [sample_rate] [block_bytes]  # long-row RSS A/B
 ```
 
 Measured numbers — the 4 MB sweep vs sdsl-lite and a **1 GiB document-scoped run**
