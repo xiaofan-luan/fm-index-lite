@@ -4,12 +4,28 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "libsais.h"    // Apache-2.0, vendored under third_party/libsais
 #include "libsais64.h"  // int64 SA path for corpora >= 2 GiB
 
 namespace milvus::index::fmindex {
+
+// libsais returns 0 on success, -1 on invalid arguments, and -2 on allocation
+// failure (see libsais.h). Ignoring it would let a partially-built or
+// uninitialized suffix array through, which silently produces a CORRUPT index
+// that then serializes and uploads as if valid. Fail the build loudly instead —
+// callers (FMIndex::Build) let this propagate so the index build task fails.
+inline void
+check_libsais_rc(int64_t rc) {
+    if (rc != 0) {
+        throw std::runtime_error(
+            "fmindex: suffix array construction failed (libsais rc=" +
+            std::to_string(rc) + ")");
+    }
+}
 
 // Suffix array via libsais (SA-IS, linear time). Input is a symbol vector
 // (bytes remapped to 1..256 plus a sentinel 0, alphabet <= 257). Produces the
@@ -39,7 +55,7 @@ build_suffix_array(const std::vector<uint32_t>& s) {
     std::vector<int32_t> saint(n + fs);
     int32_t rc =
         libsais_int(t.data(), saint.data(), static_cast<int32_t>(n), k, fs);
-    (void)rc;  // rc == 0 on success; inputs here are always valid
+    check_libsais_rc(rc);
     for (size_t i = 0; i < n; ++i) {
         sa[i] = static_cast<uint32_t>(saint[i]);
     }
@@ -63,10 +79,12 @@ build_suffix_array_symbols32(int32_t* t, size_t m, int32_t sigma) {
     const int32_t fs = 6 * 1024;  // recommended free space for performance
     std::vector<int32_t> sa(m + fs);
 #ifdef LIBSAIS_OPENMP
-    libsais_int_omp(t, sa.data(), static_cast<int32_t>(m), sigma, fs, 0);
+    int32_t rc =
+        libsais_int_omp(t, sa.data(), static_cast<int32_t>(m), sigma, fs, 0);
 #else
-    libsais_int(t, sa.data(), static_cast<int32_t>(m), sigma, fs);
+    int32_t rc = libsais_int(t, sa.data(), static_cast<int32_t>(m), sigma, fs);
 #endif
+    check_libsais_rc(rc);
     sa.resize(m);
     return sa;
 }
@@ -83,10 +101,12 @@ build_suffix_array_symbols64(int64_t* t, size_t m, int64_t sigma) {
     const int64_t fs = 6 * 1024;
     std::vector<int64_t> sa(m + fs);
 #ifdef LIBSAIS_OPENMP
-    libsais64_long_omp(t, sa.data(), static_cast<int64_t>(m), sigma, fs, 0);
+    int64_t rc =
+        libsais64_long_omp(t, sa.data(), static_cast<int64_t>(m), sigma, fs, 0);
 #else
-    libsais64_long(t, sa.data(), static_cast<int64_t>(m), sigma, fs);
+    int64_t rc = libsais64_long(t, sa.data(), static_cast<int64_t>(m), sigma, fs);
 #endif
+    check_libsais_rc(rc);
     sa.resize(m);
     return sa;
 }
@@ -119,10 +139,12 @@ build_suffix_array_bytes(const uint8_t* data, size_t n) {
     // point uses all OpenMP threads (bound by OMP_NUM_THREADS); otherwise it is
     // single-threaded.
 #ifdef LIBSAIS_OPENMP
-    libsais_omp(data, sa.data(), static_cast<int32_t>(n), fs + 1, nullptr, 0);
+    int32_t rc =
+        libsais_omp(data, sa.data(), static_cast<int32_t>(n), fs + 1, nullptr, 0);
 #else
-    libsais(data, sa.data(), static_cast<int32_t>(n), fs + 1, nullptr);
+    int32_t rc = libsais(data, sa.data(), static_cast<int32_t>(n), fs + 1, nullptr);
 #endif
+    check_libsais_rc(rc);
     std::memmove(sa.data() + 1, sa.data(), n * sizeof(int32_t));
     sa[0] = static_cast<int32_t>(n);  // sentinel suffix sorts first
     sa.resize(n + 1);
@@ -141,10 +163,13 @@ build_suffix_array_bytes64(const uint8_t* data, size_t n) {
     const int64_t fs = 6 * 1024;
     std::vector<int64_t> sa(n + 1 + fs);
 #ifdef LIBSAIS_OPENMP
-    libsais64_omp(data, sa.data(), static_cast<int64_t>(n), fs + 1, nullptr, 0);
+    int64_t rc = libsais64_omp(
+        data, sa.data(), static_cast<int64_t>(n), fs + 1, nullptr, 0);
 #else
-    libsais64(data, sa.data(), static_cast<int64_t>(n), fs + 1, nullptr);
+    int64_t rc =
+        libsais64(data, sa.data(), static_cast<int64_t>(n), fs + 1, nullptr);
 #endif
+    check_libsais_rc(rc);
     std::memmove(sa.data() + 1, sa.data(), n * sizeof(int64_t));
     sa[0] = static_cast<int64_t>(n);  // sentinel suffix sorts first
     sa.resize(n + 1);

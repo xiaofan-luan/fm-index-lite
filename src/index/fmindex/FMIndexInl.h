@@ -942,7 +942,17 @@ FMIndex::SerializeToFile(const std::string& path) const {
     }
     pad8();
     emit(doc_start_.data(), doc_start_.size() * sizeof(uint64_t));
-    std::fclose(f);
+    // fclose flushes the stdio buffer, so a write that only fails at flush time
+    // (ENOSPC / EIO) surfaces HERE, not at fwrite. Treat a non-zero fclose as a
+    // serialization failure: otherwise a silently-truncated file would return
+    // success, get uploaded and CRC'd as valid, and only be caught when a
+    // consumer fails to load it. On any failure, remove the partial file.
+    if (std::fclose(f) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        std::remove(path.c_str());
+    }
     return ok;
 }
 
