@@ -4,6 +4,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -66,12 +68,8 @@ class FMIndex {
     //                   ~ (8 / block_bytes) x the packed words. Default 64 (8
     //                   words/block): ~8x smaller directory than the finest
     //                   8-byte block at essentially no rank-throughput cost
-    //                   across corpus sizes (the smaller directory's better cache
-    //                   locality offsets the extra SWAR popcounts — see
-    //                   BENCHMARK.md). Use 8-32 for tiny indices whose directory
-    //                   already fits cache, or 128 to minimize resident memory at
-    //                   a small speed cost on small corpora. Pure space/latency
-    //                   knob, zero effect on correctness.
+    //                   across corpus sizes. Pure space/latency knob, zero
+    //                   effect on correctness.
     void
     Build(const std::vector<std::string_view>& docs,
           uint32_t sa_sample_rate = 32,
@@ -177,6 +175,31 @@ class FMIndex {
     std::vector<uint64_t>
     MatchingDocs(const uint8_t* pat, size_t plen) const;
 
+    // Streaming form of MatchingDocs: invoke `visit(doc_id)` for the document of
+    // every occurrence of `pat`, with NO per-occurrence materialization — O(1)
+    // extra memory instead of MatchingDocs' O(occurrences) temporaries (position
+    // array + (doc, offset) array + doc array). A document containing the
+    // pattern more than once is visited once per occurrence, in no particular
+    // order — callers dedup for free by setting bits in a docs-sized bitmap.
+    // This is what a scalar filter should use: a high-frequency pattern (e.g.
+    // LIKE '%a%' over repetitive text) makes MatchingDocs allocate GBs while
+    // this stays at the caller's single bitmap. An empty pattern visits nothing
+    // (as MatchingDocs).
+    template <typename Visitor>
+    void
+    VisitMatchingDocs(const uint8_t* pat, size_t plen, Visitor&& visit) const {
+        if (c_.empty() || plen == 0) {
+            return;
+        }
+        auto r = BackwardSearch(pat, plen);
+        for (size_t i = r.first; i < r.second; ++i) {
+            uint64_t pos = locateRow(i);
+            if (pos < text_len_) {  // skip the sentinel suffix
+                visit(docOf(pos));
+            }
+        }
+    }
+
     // Sorted, unique document ids containing a substring within edit distance
     // <= k of `pat` (typo / variant tolerant: names, domains, codes). Also
     // doc-granularity. Implemented by backtracking backward search that never
@@ -214,15 +237,13 @@ class FMIndex {
         return case_fold_;
     }
     // Rank-directory block size in bytes (words_per_block * 8). Larger = smaller
-    // directory / less resident RAM, slightly slower rank. Default 8 (one word).
+    // directory / less resident RAM, no throughput cost up to ~64. Default 64.
     uint32_t
     block_bytes() const {
         return words_per_block_ * 8;
     }
     // Total heap bytes of the wavelet rank directories — the part that stays
-    // resident even when the packed words are an mmap view. Scales ~1/block_bytes
-    // (one 8-byte rel_ sample per block); benchmarks use it to report the
-    // directory-space vs rank-latency tradeoff of block_bytes.
+    // resident even when the packed words are an mmap view. Scales ~1/block_bytes.
     size_t
     rank_directory_bytes() const {
         size_t t = 0;
@@ -263,6 +284,12 @@ class FMIndex {
     // storage-layer checksum). Queries assume a structurally-valid index.
     static FMIndex
     Deserialize(const std::string& blob);
+    // Move overload: take ownership of `blob` as the backing store with NO
+    // copy (owned_blob_ = std::move(blob)). Lets a caller that already holds
+    // the serialized bytes in a vector<uint8_t> (e.g. a storage reader entry)
+    // avoid a second full-index allocation. Same robustness contract.
+    static FMIndex
+    Deserialize(std::vector<uint8_t>&& blob);
     // Zero-copy load: view serialized bytes at [base, base+size) (must be
     // 8-byte aligned, e.g. mmap). The caller keeps that memory alive for the
     // index's lifetime; the large word arrays are not copied. Same robustness
@@ -293,14 +320,21 @@ class FMIndex {
     // ends with the pattern. Shared by CountSuffixDocs / LocateSuffixDocs.
     std::pair<size_t, size_t>
     suffixDocInterval(const uint8_t* pattern, size_t plen) const;
-    // Rebuild the in-RAM-only structures derived from the serialized fields:
-    // id_to_byte_ (from byte_to_id_) and isa_sample_ (from sampled_bv_ +
-    // sa_sample_vals_). Called after Build and after a load.
+    // Rebuild the (small) in-RAM-only structures derived from the serialized
+    // fields: id_to_byte_ (from byte_to_id_). Called after Build and after a
+    // load. isa_sample_ is NOT built here — see ensureIsaSample().
     void
     buildDerived();
-    // Fill *this by viewing serialized bytes at base; the wavelet/sampled word
-    // arrays are viewed, the small sample/doc arrays are copied. Returns false
-    // on a truncated/corrupt/incompatible blob.
+    // Build isa_sample_ on first use (Extract is its only consumer). Thread-safe
+    // (std::call_once); costs one O(m) pass + m/rate x 8 B of heap, paid only by
+    // workloads that actually Extract.
+    void
+    ensureIsaSample() const;
+    // Fill *this by viewing serialized bytes at base: the wavelet/sampled word
+    // arrays, the sampled-SA values AND the doc boundaries are all viewed in
+    // place (validated read-only, never copied) — the only heap rebuilt on load
+    // is the rank directories. Returns false on a truncated/corrupt/
+    // incompatible blob.
     bool
     parseView(const uint8_t* base, size_t size);
     // Append the fixed header (everything before the aligned payload arrays).
@@ -324,21 +358,48 @@ class FMIndex {
     std::vector<size_t>
         first_;             // per-symbol map_zero (derived, not serialized)
     BitVector sampled_bv_;  // row is SA-sampled? rank = sample index
-    // SA values of sampled rows, in row order. Held as uint64 in RAM; serialized
-    // at 4 bytes when len < 2^32, else 8 (so small corpora keep the small index).
-    std::vector<uint64_t> sa_sample_vals_;
+
+    // SA values of sampled rows, in row order — serialized at 4 bytes when
+    // len < 2^32 (narrow), else 8 (wide). Build owns them in sample_vals_owned_
+    // (wide in RAM); a load VIEWS them straight from the (mmap'd or owned) blob
+    // in whichever width they were stored — no heap copy, no widening pass.
+    // Exactly one of sv_wide_ / sv_narrow_ is set on a valid index; all access
+    // goes through sample_val(). At the default sample rate these arrays are of
+    // the same order as the whole blob, so copying them on load would defeat
+    // mmap's memory story.
+    std::vector<uint64_t> sample_vals_owned_;  // Build-mode storage only
+    const uint64_t* sv_wide_ = nullptr;
+    const uint32_t* sv_narrow_ = nullptr;
+    size_t n_samples_ = 0;
+
+    uint64_t
+    sample_val(size_t i) const {
+        return sv_narrow_ != nullptr ? static_cast<uint64_t>(sv_narrow_[i])
+                                     : sv_wide_[i];
+    }
+
     // Internal document boundaries (offsets into the separator-injected buffer),
-    // size n_docs+1: doc_start_[d] = internal start of doc d, doc_start_[n_docs]
-    // = text_len_. Doc d's content is [doc_start_[d], doc_start_[d+1]-1) with the
-    // separator symbol at doc_start_[d+1]-1.
-    std::vector<uint64_t> doc_start_;
+    // n_doc_bounds_ == n_docs+1 entries: doc_start_[d] = internal start of doc
+    // d, doc_start_[n_docs] = text_len_. Doc d's content is [doc_start_[d],
+    // doc_start_[d+1]-1) with the separator symbol at doc_start_[d+1]-1.
+    // Same ownership scheme as the samples: Build owns doc_bounds_owned_, a
+    // load views the 8-byte-aligned array in the blob directly.
+    std::vector<uint64_t> doc_bounds_owned_;  // Build-mode storage only
+    const uint64_t* doc_start_ = nullptr;
+    size_t n_doc_bounds_ = 0;
+
     int32_t sep_id_ =
         1;  // dense id of the separator symbol (constant; not a byte)
     // Derived, in-RAM only (rebuilt on load, never serialized):
     std::vector<uint8_t>
         id_to_byte_;  // dense id -> byte (inverse of byte_to_id_)
-    std::vector<uint64_t>
-        isa_sample_;  // isa_sample_[k] = row whose SA value = k*rate
+    // isa_sample_[k] = row whose SA value = k*rate. Only Extract needs it, and
+    // building it walks ALL m rows (an O(m) pass + m/rate x 8 B of heap) — so it
+    // is built LAZILY on the first Extract call (thread-safe via isa_once_),
+    // never at load time. Locate/Count/prefix/suffix never touch it.
+    mutable std::vector<uint64_t> isa_sample_;
+    mutable std::unique_ptr<std::once_flag> isa_once_ =
+        std::make_unique<std::once_flag>();
     std::vector<uint8_t>
         owned_blob_;  // backs the views when Deserialized by copy
 };
