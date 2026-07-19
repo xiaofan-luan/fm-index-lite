@@ -114,6 +114,27 @@ single documents.
   `LocateDocs`/`MatchingDocs` latency is dominated by the single LF-walk to a sampled
   position (≤ `sa_sample_rate` steps). Patterns with many hits scale with hit count.
 
+## Compact-build memory A/B (long row)
+
+`bench_build_memory` isolates the byte amplification by building over one long
+printable-byte document. Apple Silicon, Release build, OpenMP off,
+`sa_sample_rate=8`, `block_bytes=64`; each 64 MiB result is three fresh-process
+runs with identical output.
+
+| corpus | implementation | build time | peak RSS | peak / corpus |
+|---|---|---:|---:|---:|
+| 64 MiB | prior int32 text + SA + separate BWT | 3.25–3.30 s | 916.4–916.5 MiB | **14.32×** |
+| 64 MiB | releasable scratch + SA/BWT reuse + narrow samples | 3.07–3.12 s | 619.5 MiB | **9.68×** |
+| 256 MiB | optimized | 13.0 s | 2473.5 MiB | **9.66×** |
+
+The reduction is structural, not a smaller test artifact: the ratio stays flat
+from 64 to 256 MiB. At the old peak, caller data (1×), int32 symbol text (4×),
+int32 SA (4×), and uint16 BWT (2×) overlapped, and later allocator-retained
+blocks stacked with sampling/wavelet allocations. The optimized path samples
+before repurposing the SA, overwrites SA entries with BWT symbols, releases the
+text mapping, and only then materializes the uint16 BWT. It also stores compact
+sample values as uint32 and removes the wavelet's n-byte digit array.
+
 ## Scorecard vs sdsl (the apples-to-apples reference)
 
 | axis | verdict |
@@ -148,6 +169,34 @@ are **3–6× faster than the reference at equal size**.
 The full unit-test suite passes; counts were byte-identical to sdsl across 120k
 queries throughout development.
 
+## Rank-block granularity (`block_bytes`)
+
+The wavelet rank directory (one 8-byte `rel_` sample per block) is rebuilt on
+load and stays resident even when the packed words are an mmap view, so it
+dominates the resident RAM of a mmap'd index. `block_bytes` sets how many bytes
+of packed words one block spans: the directory shrinks ~ `8 / block_bytes`. It
+is a pure space/latency knob — results are byte-identical across values
+(`BlockGranularityResultsInvariant` test).
+
+`bench_blocksize`, resident directory as a fraction of corpus (constant across
+sizes) and `LocateDocs` throughput vs the finest 8-byte block, sample rate 8:
+
+| block_bytes | directory / corpus | locate q/s vs block=8 |
+|---|---|---|
+| 8 (finest) | 0.53–0.80x | baseline |
+| 32 | 0.13–0.20x | ≈ baseline .. +48% |
+| **64 (default)** | **0.07–0.10x** | **−6% (4 MiB) .. +50% (16 MiB)** |
+| 128 | 0.03–0.05x | −18% (4 MiB) .. +98% (16 MiB) |
+
+The directory shrinks monotonically; throughput is an inverted-U with the peak
+near 32–64. A coarser block does *more* SWAR popcounts per rank but the smaller
+directory has far better cache locality, and on corpora whose 8-byte directory
+overflows cache (≥ 16 MiB here) that wins outright. At 256 MiB every value is
+within ~5% on speed while the directory still drops 16×. **Default 64**: ~8×
+smaller resident directory than the finest block at no throughput cost across
+4 MiB–256 MiB (text and DNA); the on-disk index size is unchanged (the directory
+is not serialized). Use 8–32 for tiny indices, 128 to minimize resident memory.
+
 ## Reproduce
 
 ```bash
@@ -155,6 +204,8 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4
 ./build/bench_fmindex     # ours: build / count / batch / locate / size (4 MB sweep)
 ./build/bench_mmap        # in-RAM vs mmap query throughput
 ./build/bench_gig [GiB]   # 1 GiB (default) document-scoped build + query, peak RSS
+./build/bench_build_memory [MiB] [sample_rate] [block_bytes]  # one-long-row peak RSS
+./build/bench_blocksize [corpus_bytes] [kind 0=dna 1=text]  # block_bytes sweep
 ```
 
 The sdsl-lite (`csa_wt`) and Lance (`lancedb` 0.31, `Index::Fm`) numbers above were

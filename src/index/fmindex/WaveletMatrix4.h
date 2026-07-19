@@ -21,24 +21,20 @@ class WaveletMatrix4 {
     // partition buffers (the build memory peak) half-size. Takes seq by value:
     // pass with std::move to build without copying it (the caller's buffer
     // becomes the working array). Memory during construction is two n-element
-    // uint16 buffers (cur + next, ping-ponged across levels) plus one n-byte
-    // digit array — not the 4 growable buckets of a naive partition.
-    WaveletMatrix4(std::vector<uint16_t> seq, uint32_t qlevels)
+    // uint16 buffers (cur + next, ping-ponged across levels); digits are packed
+    // directly into each QuadVector and recomputed for the stable scatter.
+    WaveletMatrix4(std::vector<uint16_t> seq,
+                   uint32_t qlevels,
+                   uint32_t words_per_block = 1)
         : n_(seq.size()), qlevels_(qlevels) {
         qv_.reserve(qlevels_);
         start_.assign(qlevels_, {0, 0, 0, 0});
         std::vector<uint16_t> cur = std::move(seq);
         std::vector<uint16_t> next(n_);
-        std::vector<uint8_t> digits(n_);
         for (uint32_t l = 0; l < qlevels_; ++l) {
             uint32_t shift = 2 * (qlevels_ - 1 - l);
             std::array<size_t, 4> hist{0, 0, 0, 0};
-            for (size_t i = 0; i < n_; ++i) {
-                uint8_t d = (cur[i] >> shift) & 3u;
-                digits[i] = d;
-                ++hist[d];
-            }
-            qv_.emplace_back(digits);
+            qv_.emplace_back(cur, shift, hist, words_per_block);
             start_[l][0] = 0;
             start_[l][1] = hist[0];
             start_[l][2] = hist[0] + hist[1];
@@ -48,7 +44,8 @@ class WaveletMatrix4 {
             std::array<size_t, 4> off{
                 start_[l][0], start_[l][1], start_[l][2], start_[l][3]};
             for (size_t i = 0; i < n_; ++i) {
-                next[off[digits[i]]++] = cur[i];
+                const uint8_t digit = (cur[i] >> shift) & 3u;
+                next[off[digit]++] = cur[i];
             }
             cur.swap(next);
         }
