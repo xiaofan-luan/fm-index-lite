@@ -21,7 +21,7 @@ namespace milvus::index::fmindex {
 // Streams the index straight to the file (no intermediate full-index blob).
 inline bool
 SaveToFile(const FMIndex& fm, const std::string& path) {
-    return fm.SerializeToFile(path);
+    return fm.SerializeToFile(path) == FMIndex::SerializeFileStatus::Success;
 }
 
 // An FMIndex backed by a read-only memory mapping. The mapping (page-aligned, so

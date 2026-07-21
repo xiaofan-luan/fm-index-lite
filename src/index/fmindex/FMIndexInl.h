@@ -4,10 +4,13 @@
 #pragma once
 #include "index/fmindex/FMIndex.h"
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <map>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -48,6 +51,12 @@ FMIndex::Build(const std::vector<std::string_view>& docs,
     doc_bounds_owned_.reserve(docs.size() + 1);
     for (const auto& d : docs) {
         doc_bounds_owned_.push_back(internal_len);
+        if (internal_len == std::numeric_limits<uint64_t>::max() ||
+            d.size() >
+                std::numeric_limits<uint64_t>::max() - internal_len - 1) {
+            throw std::length_error(
+                "FMIndex: corpus length overflows uint64_t");
+        }
         internal_len += d.size() + 1;  // content + one separator
     }
     doc_bounds_owned_.push_back(
@@ -127,8 +136,7 @@ FMIndex::Build(const std::vector<std::string_view>& docs,
     //    overwritten with BWT symbols, so no separate BWT allocation overlaps
     //    the 4x text + 4x SA window.
     ScratchArray<int32_t> t32(use64 ? 0 : m);
-    ScratchArray<int32_t> sa32(
-        use64 ? 0 : m + kSuffixArrayExtraSpace);
+    ScratchArray<int32_t> sa32(use64 ? 0 : m + kSuffixArrayExtraSpace);
     std::vector<int64_t> t64, sa64;
     std::vector<uint16_t> bwt;
     auto fill_symbols = [&](auto* t) {
@@ -194,8 +202,7 @@ FMIndex::Build(const std::vector<std::string_view>& docs,
         bwt.resize(m);
         for (size_t i = 0; i < m; ++i) {
             const uint64_t v = static_cast<uint64_t>(sa64[i]);
-            bwt[i] =
-                v == 0 ? uint16_t{0} : static_cast<uint16_t>(t64[v - 1]);
+            bwt[i] = v == 0 ? uint16_t{0} : static_cast<uint16_t>(t64[v - 1]);
         }
         std::vector<int64_t>().swap(t64);
         std::vector<int64_t>().swap(sa64);
@@ -951,42 +958,52 @@ FMIndex::Serialize() const {
     return s;
 }
 
-inline bool
+inline FMIndex::SerializeFileStatus
 FMIndex::SerializeToFile(const std::string& path) const {
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) {
-        return false;
+        return SerializeFileStatus::OpenFailed;
     }
-    // Only the small header is buffered; the large arrays stream straight to
-    // the file (no intermediate full-index copy).
-    std::string header;
-    writeHeader(header);
-    size_t off = 0;
     bool ok = true;
-    auto emit = [&](const void* p, size_t n) {
-        if (n && std::fwrite(p, 1, n, f) != n) {
-            ok = false;
+    int failure_errno = 0;
+    try {
+        // Only the small header is buffered; the large arrays stream straight to
+        // the file (no intermediate full-index copy).
+        std::string header;
+        writeHeader(header);
+        size_t off = 0;
+        auto emit = [&](const void* p, size_t n) {
+            if (n && std::fwrite(p, 1, n, f) != n) {
+                ok = false;
+                if (failure_errno == 0) {
+                    failure_errno = errno;
+                }
+            }
+            off += n;
+        };
+        static const char kZero[8] = {0};
+        auto pad8 = [&] { emit(kZero, (8 - (off & 7u)) & 7u); };
+        emit(header.data(), header.size());
+        for (uint32_t l = 0; l < qlevels_; ++l) {
+            pad8();
+            const QuadVector& q = wm_.levels_qv()[l];
+            emit(q.words(), q.word_count() * sizeof(uint64_t));
         }
-        off += n;
-    };
-    static const char kZero[8] = {0};
-    auto pad8 = [&] { emit(kZero, (8 - (off & 7u)) & 7u); };
-    emit(header.data(), header.size());
-    for (uint32_t l = 0; l < qlevels_; ++l) {
         pad8();
-        const QuadVector& q = wm_.levels_qv()[l];
-        emit(q.words(), q.word_count() * sizeof(uint64_t));
+        emit(sampled_bv_.words(), sampled_bv_.word_count() * sizeof(uint64_t));
+        pad8();
+        if (wide_storage_) {
+            emit(sv_wide_, n_samples_ * sizeof(uint64_t));
+        } else {
+            emit(sv_narrow_, n_samples_ * sizeof(uint32_t));
+        }
+        pad8();
+        emit(doc_start_, n_doc_bounds_ * sizeof(uint64_t));
+    } catch (...) {
+        std::fclose(f);
+        std::remove(path.c_str());
+        throw;
     }
-    pad8();
-    emit(sampled_bv_.words(), sampled_bv_.word_count() * sizeof(uint64_t));
-    pad8();
-    if (wide_storage_) {
-        emit(sv_wide_, n_samples_ * sizeof(uint64_t));
-    } else {
-        emit(sv_narrow_, n_samples_ * sizeof(uint32_t));
-    }
-    pad8();
-    emit(doc_start_, n_doc_bounds_ * sizeof(uint64_t));
     // fclose flushes the stdio buffer, so a write that only fails at flush time
     // (ENOSPC / EIO) surfaces HERE, not at fwrite. Treat a non-zero fclose as a
     // serialization failure: otherwise a silently-truncated file would return
@@ -995,11 +1012,18 @@ FMIndex::SerializeToFile(const std::string& path) const {
     // caller never uploads it.
     if (std::fclose(f) != 0) {
         ok = false;
+        if (failure_errno == 0) {
+            failure_errno = errno;
+        }
     }
     if (!ok) {
         std::remove(path.c_str());
+        // stdio is expected to set errno on a short write / failed flush, but
+        // the C contract does not require it. Never make the caller report
+        // strerror(0) ("Success") for an operation that actually failed.
+        errno = failure_errno == 0 ? EIO : failure_errno;
     }
-    return ok;
+    return ok ? SerializeFileStatus::Success : SerializeFileStatus::WriteFailed;
 }
 
 inline bool
@@ -1015,6 +1039,9 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
             return false;
         }
         sa_sample_rate_ = get<uint32_t>(p, end);
+        if (sa_sample_rate_ == 0) {
+            return false;
+        }
         sigma_ = get<uint32_t>(p, end);
         qlevels_ = get<uint32_t>(p, end);
         uint32_t flags = get<uint32_t>(p, end);  // former pad, now flags
@@ -1045,6 +1072,11 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
             }
         }
         text_len_ = get<uint64_t>(p, end);
+        if (text_len_ >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            text_len_ >= std::numeric_limits<size_t>::max()) {
+            return false;
+        }
         for (int i = 0; i < 256; ++i) {
             byte_to_id_[i] = get<int32_t>(p, end);
             // A byte maps to -1 (absent) or a content id in [2, sigma_). Ids 0
@@ -1075,26 +1107,36 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         uint64_t n_samples = get<uint64_t>(p, end);
         uint64_t n_docs = get<uint64_t>(p, end);
 
-        const size_t m = text_len_ + 1;
+        const size_t m = static_cast<size_t>(text_len_) + 1;
         // The payload section sizes are fully determined by m; reject any blob
         // whose declared counts don't match (a mutated size would otherwise
         // drive align_view / from_view to read past the mapping).
-        const uint64_t exp_qnw = (m + 31) / 32;  // 2-bit symbols, 32 per word
-        const uint64_t exp_snw = (m + 63) / 64;  // 1-bit rows, 64 per word
+        const uint64_t exp_qnw =
+            m / 32 + (m % 32 != 0);  // 2-bit symbols, 32 per word
+        const uint64_t exp_snw =
+            m / 64 + (m % 64 != 0);  // 1-bit rows, 64 per word
         for (uint32_t l = 0; l < qlevels_; ++l) {
             if (qnw[l] != exp_qnw) {
                 return false;
             }
         }
-        if (sampled_nw != exp_snw || n_samples > m || n_docs == 0 ||
-            n_docs > m + 1) {
+        const uint64_t expected_samples = text_len_ / sa_sample_rate_ + 1;
+        if (sampled_nw != exp_snw || n_samples != expected_samples ||
+            n_docs == 0 || n_docs > m) {
             return false;
         }
-        auto align_view = [&](uint64_t nbytes) -> const uint64_t* {
+        auto checked_bytes = [](uint64_t count, size_t width) -> size_t {
+            if (count > std::numeric_limits<size_t>::max() / width) {
+                throw std::runtime_error("fmindex: payload size overflow");
+            }
+            return static_cast<size_t>(count) * width;
+        };
+        auto align_view = [&](size_t nbytes) -> const uint64_t* {
             size_t off =
                 static_cast<size_t>(p - reinterpret_cast<const char*>(base));
             size_t pad = (8 - (off & 7u)) & 7u;
-            if (p + pad + nbytes > end) {
+            size_t remaining = static_cast<size_t>(end - p);
+            if (pad > remaining || nbytes > remaining - pad) {
                 throw std::runtime_error("fmindex: truncated payload");
             }
             p += pad;
@@ -1106,7 +1148,8 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         std::vector<QuadVector> qvs;
         qvs.reserve(qlevels_);
         for (uint32_t l = 0; l < qlevels_; ++l) {
-            const uint64_t* w = align_view(qnw[l] * sizeof(uint64_t));
+            const uint64_t* w =
+                align_view(checked_bytes(qnw[l], sizeof(uint64_t)));
             qvs.push_back(
                 QuadVector::from_view(m, w, qnw[l], words_per_block_));
         }
@@ -1130,7 +1173,8 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         for (uint32_t c = 0; c < sigma_; ++c) {
             first_[c] = wm_.map_zero(c);
         }
-        const uint64_t* sw = align_view(sampled_nw * sizeof(uint64_t));
+        const uint64_t* sw =
+            align_view(checked_bytes(sampled_nw, sizeof(uint64_t)));
         sampled_bv_ = BitVector::from_view(m, sw, sampled_nw);
         // The set-bit count must equal the number of sampled values; otherwise
         // sample_val(sampled_bv_.rank1(row)) could index past the array.
@@ -1144,7 +1188,7 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         // from zero-copy. Validation below reads the views once, allocates
         // nothing.
         const size_t pw = wide_storage_ ? 8 : 4;
-        const uint64_t* svp = align_view(n_samples * pw);
+        const uint64_t* svp = align_view(checked_bytes(n_samples, pw));
         if (wide_storage_) {
             sv_wide_ = svp;
             sv_narrow_ = nullptr;
@@ -1157,11 +1201,13 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         // would drive ensureIsaSample's isa_sample_[val/rate] write out of
         // bounds on a later Extract.
         for (size_t i = 0; i < n_samples_; ++i) {
-            if (sample_val(i) > text_len_) {
+            if (sample_val(i) > text_len_ ||
+                sample_val(i) % sa_sample_rate_ != 0) {
                 return false;
             }
         }
-        const uint64_t* dsp = align_view(n_docs * sizeof(uint64_t));
+        const uint64_t* dsp =
+            align_view(checked_bytes(n_docs, sizeof(uint64_t)));
         doc_start_ = dsp;
         n_doc_bounds_ = static_cast<size_t>(n_docs);
         // doc_start_ must be a valid boundary list: start at 0, be strictly
@@ -1178,6 +1224,8 @@ FMIndex::parseView(const uint8_t* base, size_t size) {
         }
         buildDerived();  // id_to_byte_ only; isa_sample_ is lazy (Extract)
         return true;
+    } catch (const std::bad_alloc&) {
+        throw;
     } catch (const std::exception&) {
         return false;
     }

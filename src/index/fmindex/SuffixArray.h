@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -41,8 +42,12 @@ class ScratchArray {
 #ifdef FMIX_USE_MMAP_SCRATCH
         const size_t bytes = size_ * sizeof(T);
         if (bytes >= (size_t{1} << 20)) {
-            void* mapping = mmap(
-                nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            void* mapping = mmap(nullptr,
+                                 bytes,
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANON,
+                                 -1,
+                                 0);
             if (mapping != MAP_FAILED) {
                 data_ = static_cast<T*>(mapping);
                 mapped_bytes_ = bytes;
@@ -108,7 +113,15 @@ class ScratchArray {
 // callers (FMIndex::Build) let this propagate so the index build task fails.
 inline void
 check_libsais_rc(int64_t rc) {
+    if (rc == -2) {
+        // libsais reserves -2 specifically for allocation failure. Preserve that
+        // distinction so Milvus can surface MemAllocateFailed (retriable) instead
+        // of collapsing an OOM into a permanent generic build error.
+        throw std::bad_alloc();
+    }
     if (rc != 0) {
+        // -1 is an invalid-argument/internal-contract failure. It indicates a bug
+        // in the build inputs assembled by this library, not resource pressure.
         throw std::runtime_error(
             "fmindex: suffix array construction failed (libsais rc=" +
             std::to_string(rc) + ")");
@@ -158,10 +171,7 @@ build_suffix_array(const std::vector<uint32_t>& s) {
 // buffers are caller-owned scratch mappings so they can be unmapped immediately
 // after the BWT/sampling phase. For m <= INT32_MAX.
 inline void
-build_suffix_array_symbols32(int32_t* t,
-                             size_t m,
-                             int32_t sigma,
-                             int32_t* sa) {
+build_suffix_array_symbols32(int32_t* t, size_t m, int32_t sigma, int32_t* sa) {
     if (m <= 1) {
         if (m == 1) {
             sa[0] = 0;
@@ -170,8 +180,7 @@ build_suffix_array_symbols32(int32_t* t,
     }
     constexpr int32_t fs = static_cast<int32_t>(kSuffixArrayExtraSpace);
 #ifdef LIBSAIS_OPENMP
-    int32_t rc =
-        libsais_int_omp(t, sa, static_cast<int32_t>(m), sigma, fs, 0);
+    int32_t rc = libsais_int_omp(t, sa, static_cast<int32_t>(m), sigma, fs, 0);
 #else
     int32_t rc = libsais_int(t, sa, static_cast<int32_t>(m), sigma, fs);
 #endif
@@ -193,7 +202,8 @@ build_suffix_array_symbols64(int64_t* t, size_t m, int64_t sigma) {
     int64_t rc =
         libsais64_long_omp(t, sa.data(), static_cast<int64_t>(m), sigma, fs, 0);
 #else
-    int64_t rc = libsais64_long(t, sa.data(), static_cast<int64_t>(m), sigma, fs);
+    int64_t rc =
+        libsais64_long(t, sa.data(), static_cast<int64_t>(m), sigma, fs);
 #endif
     check_libsais_rc(rc);
     sa.resize(m);
@@ -228,10 +238,11 @@ build_suffix_array_bytes(const uint8_t* data, size_t n) {
     // point uses all OpenMP threads (bound by OMP_NUM_THREADS); otherwise it is
     // single-threaded.
 #ifdef LIBSAIS_OPENMP
-    int32_t rc =
-        libsais_omp(data, sa.data(), static_cast<int32_t>(n), fs + 1, nullptr, 0);
+    int32_t rc = libsais_omp(
+        data, sa.data(), static_cast<int32_t>(n), fs + 1, nullptr, 0);
 #else
-    int32_t rc = libsais(data, sa.data(), static_cast<int32_t>(n), fs + 1, nullptr);
+    int32_t rc =
+        libsais(data, sa.data(), static_cast<int32_t>(n), fs + 1, nullptr);
 #endif
     check_libsais_rc(rc);
     std::memmove(sa.data() + 1, sa.data(), n * sizeof(int32_t));

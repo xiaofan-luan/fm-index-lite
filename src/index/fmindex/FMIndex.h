@@ -29,6 +29,12 @@ namespace milvus::index::fmindex {
 // matches.
 class FMIndex {
  public:
+    enum class SerializeFileStatus {
+        Success,
+        OpenFailed,
+        WriteFailed,
+    };
+
     FMIndex() = default;
 
     // Build the index over a set of documents. Document i (0-based, in the order
@@ -209,7 +215,7 @@ class FMIndex {
     std::vector<uint64_t>
     FuzzyMatchingDocs(const uint8_t* pat, size_t plen, uint32_t k) const;
 
-    // --- accessors used by tests ---
+    // --- metadata accessors ---
     size_t
     bwt_size() const {
         return text_len_ + 1;
@@ -235,6 +241,20 @@ class FMIndex {
     bool
     case_insensitive() const {
         return case_fold_;
+    }
+    // Sampling rate persisted in the blob. Query-side cost decisions must use
+    // this value rather than reconstructing it from external index metadata.
+    uint32_t
+    sa_sample_rate() const {
+        return sa_sample_rate_;
+    }
+    // Number of indexed documents. The serialized boundary array contains one
+    // extra terminal offset, so expose the logical count rather than its raw
+    // element count. Milvus uses this to cross-check packed-file metadata before
+    // allocating row-sized bitmaps.
+    size_t
+    document_count() const {
+        return n_doc_bounds_ == 0 ? 0 : n_doc_bounds_ - 1;
     }
     // Rank-directory block size in bytes (words_per_block * 8). Larger = smaller
     // directory / less resident RAM, no throughput cost up to ~64. Default 64.
@@ -268,7 +288,7 @@ class FMIndex {
     // Stream the serialized bytes straight to a file, without materializing a
     // full-index blob first (only a small header is buffered) — one fewer copy
     // than Serialize()+write on the save path.
-    bool
+    SerializeFileStatus
     SerializeToFile(const std::string& path) const;
 
     // Copy the blob and load (owns its bytes).
@@ -343,8 +363,8 @@ class FMIndex {
 
     uint32_t sa_sample_rate_ = 1;
     uint32_t words_per_block_ = 1;  // rank-block granularity (block_bytes / 8)
-    bool case_fold_ = false;     // ASCII A-Z folded to a-z at build time
-    bool wide_storage_ = false;  // sampled-SA positions stored 8B (>=4GiB)
+    bool case_fold_ = false;        // ASCII A-Z folded to a-z at build time
+    bool wide_storage_ = false;     // sampled-SA positions stored 8B (>=4GiB)
     uint64_t text_len_ = 0;  // INTERNAL length incl. separators, no sentinel
     uint32_t sigma_ = 2;     // dense alphabet size (incl. sentinel + separator)
     uint32_t qlevels_ = 0;   // ceil(ceil(log2(sigma_)) / 2)

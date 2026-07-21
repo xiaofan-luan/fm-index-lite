@@ -84,7 +84,8 @@ main(int argc, char** argv) {
     // ---- on-disk index size (streamed, no full in-RAM blob) ----
     std::string path = "/tmp/fmidx_gig.fmix";
     auto ts = clk::now();
-    bool ok = fm.SerializeToFile(path);
+    bool ok =
+        fm.SerializeToFile(path) == FMIndex::SerializeFileStatus::Success;
     double ser_ms = ms_since(ts);
     size_t idx_bytes = 0;
     if (ok) {
